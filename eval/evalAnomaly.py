@@ -61,6 +61,8 @@ def main():
     args = parser.parse_args()
     anomaly_score_list = []
     ood_gts_list = []
+    max_logit_list = []
+    entropy_list = []
 
     if not os.path.exists('results.txt'):
         open('results.txt', 'w').close()
@@ -100,7 +102,19 @@ def main():
         #images = images.permute(0,3,1,2) #Action already done by ToTensor()
         with torch.no_grad():
             result = model(images)
-        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)            
+        #MSP
+        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)
+        #MAX LOGIT low logit means anomaly ->  we use the -max logit as anomaly score 
+        max_logit_tensor = torch.max(result, dim=1)[0]
+        max_logit_score = -max_logit_tensor.squeeze(0).data.cpu().numpy()
+        #ENTROPY -> - sum(p*log(p))
+        # Compute log-softmax probabilities
+        softmax = torch.nn.Softmax(dim=1)  
+        prob = softmax(result)
+        log_prob = torch.log(prob + 1e-10)
+        # Compute entropy (adding a small constant to avoid log(0))
+        entropy_tensor = -torch.sum(prob * log_prob, dim=1)
+        entropy_score = entropy_tensor.squeeze(0).data.cpu().numpy()        
         pathGT = path.replace("images", "labels_masks")                
         if "RoadObsticle21" in pathGT:
            pathGT = pathGT.replace("webp", "png")
@@ -130,7 +144,11 @@ def main():
         else:
              ood_gts_list.append(ood_gts)
              anomaly_score_list.append(anomaly_result)
-        del result, anomaly_result, ood_gts, mask
+             #Max Logit
+             max_logit_list.append(max_logit_score)
+             #Entropy
+             entropy_list.append(entropy_score)
+        del result, anomaly_result, ood_gts, mask, max_logit_tensor, entropy_tensor, prob, log_prob #free GPU memory
         torch.cuda.empty_cache()
 
     file.write( "\n")
@@ -153,10 +171,36 @@ def main():
     prc_auc = average_precision_score(val_label, val_out)
     fpr = fpr_at_95_tpr(val_out, val_label)
 
-    print(f'AUPRC score: {prc_auc*100.0}')
-    print(f'FPR@TPR95: {fpr*100.0}')
+    print(f'AUPRC score MSP: {prc_auc*100.0}')
+    print(f'FPR@TPR95 MSP: {fpr*100.0}')
 
-    file.write(('    AUPRC score:' + str(prc_auc*100.0) + '   FPR@TPR95:' + str(fpr*100.0) ))
+    # Max Logit
+    max_logit_scores = np.array(max_logit_list)
+    ood_out_maxlogit = max_logit_scores[ood_mask]
+    ind_out_maxlogit = max_logit_scores[ind_mask]
+    val_out_maxlogit = np.concatenate((ind_out_maxlogit, ood_out_maxlogit))
+
+    prc_auc_maxlogit = average_precision_score(val_label, val_out_maxlogit)
+    fpr_maxlogit = fpr_at_95_tpr(val_out_maxlogit, val_label)
+
+    print(f'AUPRC score MaxLogit: {prc_auc_maxlogit*100.0}')
+    print(f'FPR@TPR95 MaxLogit: {fpr_maxlogit*100.0}')
+
+    # Entropy
+    entropy_scores = np.array(entropy_list)
+    ood_out_entropy = entropy_scores[ood_mask]
+    ind_out_entropy = entropy_scores[ind_mask]
+    val_out_entropy = np.concatenate((ind_out_entropy, ood_out_entropy))
+
+    prc_auc_entropy = average_precision_score(val_label, val_out_entropy)
+    fpr_entropy = fpr_at_95_tpr(val_out_entropy, val_label)
+
+    print(f'AUPRC score Entropy: {prc_auc_entropy*100.0}')
+    print(f'FPR@TPR95 Entropy: {fpr_entropy*100.0}')
+
+    file.write(('    AUPRC score MSP:' + str(prc_auc*100.0) + '   FPR@TPR95 MSP:' + str(fpr*100.0) + '\n'
+                '    AUPRC score MaxLogit:' + str(prc_auc_maxlogit*100.0) + '   FPR@TPR95 MaxLogit:' + str(fpr_maxlogit*100.0) + '\n'
+                '    AUPRC score Entropy:' + str(prc_auc_entropy*100.0) + '   FPR@TPR95 Entropy:' + str(fpr_entropy*100.0) + '\n'))
     file.close()
 
 if __name__ == '__main__':
