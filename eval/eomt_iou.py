@@ -19,10 +19,26 @@ from torchvision.transforms import Compose, CenterCrop, Normalize, Resize
 from torchvision.transforms import ToTensor, ToPILImage
 
 from dataset import cityscapes
-from eomt.models.vit import ViT
-from eomt.models.eomt import EoMT
 from transform import Relabel, ToLabel, Colorize
 from iouEval import iouEval, getColorEntry
+
+# -------------------------------------------------------------------
+# AGGIUNTA DELLA CARTELLA eomt/ AL PYTHONPATH
+# -------------------------------------------------------------------
+# Struttura:
+#   MaskArchitectureAnomaly_CourseProject/
+#       eomt/
+#           models/vit.py, eomt.py, ...
+#       eval/
+#           evalAnomaly_eomt.py  <-- questo file
+CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CUR_DIR)          # MaskArchitectureAnomaly_CourseProject/
+EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")   # .../MaskArchitectureAnomaly_CourseProject/eomt
+if EOMT_ROOT not in sys.path:
+    sys.path.append(EOMT_ROOT)
+
+from models.vit import ViT
+from models.eomt import EoMT
 
 NUM_CHANNELS = 3
 NUM_CLASSES = 19 
