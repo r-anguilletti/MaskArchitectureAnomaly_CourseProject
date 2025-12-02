@@ -1,25 +1,44 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 import os
+import sys
 import glob
 import torch
+import torch.nn.functional as F
 import random
 from PIL import Image
 import numpy as np
-from erfnet import ERFNet
 import os.path as osp
 from argparse import ArgumentParser
-from ood_metrics import fpr_at_95_tpr, calc_metrics, plot_roc, plot_pr, plot_barcode
-from sklearn.metrics import roc_auc_score, roc_curve, auc, precision_recall_curve, average_precision_score
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+from ood_metrics import fpr_at_95_tpr
+from sklearn.metrics import average_precision_score
+from torchvision.transforms import Compose, Resize, ToTensor
 
+# -------------------------------------------------------------------
+# CONFIGURAZIONE PATH E IMPORT
+# -------------------------------------------------------------------
+CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CUR_DIR)
+EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
+if EOMT_ROOT not in sys.path:
+    sys.path.append(EOMT_ROOT)
+
+from models.vit import ViT
+from models.eomt import EoMT
+
+# -------------------------------------------------------------------
+# SETUP & SEED
+# -------------------------------------------------------------------
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
-
-NUM_CHANNELS = 3
-NUM_CLASSES = 20
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
+
+NUM_CLASSES = 20  # Cityscapes classes (solitamente 19 + background o void, verifica la tua config)
+NUM_Q = 100
+NUM_BLOCKS = 3
+BACKBONE_NAME = "vit_base_patch14_reg4_dinov2"
 
 input_transform = Compose([
     Resize((512, 1024), Image.BILINEAR),
@@ -30,153 +49,186 @@ target_transform = Compose([
     Resize((512, 1024), Image.NEAREST),
 ])
 
-def get_rba_masks(H, W, device):
-    """Genera le maschere per l'ensemble RbA."""
-    masks = []
-    # 1. Originale (tutto visibile)
-    masks.append(torch.ones((1, 1, H, W), device=device))
-    
-    # 2. Scacchiera
-    check_size = 64
-    mask_check = torch.ones((H, W), device=device)
-    for i in range(0, H, check_size):
-        for j in range(0, W, check_size):
-            if ((i // check_size) + (j // check_size)) % 2 == 0:
-                mask_check[i:i+check_size, j:j+check_size] = 0
-    masks.append(mask_check.unsqueeze(0).unsqueeze(0))
-    
-    # 3. Scacchiera Inversa
-    masks.append(1.0 - mask_check.unsqueeze(0).unsqueeze(0))
-    
-    # 4. Strisce Verticali
-    mask_v = torch.ones((H, W), device=device)
-    mask_v[:, ::128] = 0
-    masks.append(mask_v.unsqueeze(0).unsqueeze(0))
-    
-    return masks
-
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--input", default="/path/to/dataset/*.png", nargs="+")  
-    parser.add_argument('--loadDir', default="../trained_models/")
-    parser.add_argument('--loadWeights', default="erfnet_pretrained.pth")
-    parser.add_argument('--loadModel', default="erfnet.py")
-    parser.add_argument('--cpu', action='store_true')
+    parser.add_argument("--input", default="/home/shyam/Mask2Former/unk-eval/RoadObsticle21/images/*.webp", nargs="+")
+    parser.add_argument("--loadDir", default="../trained_models/")
+    parser.add_argument("--loadWeights", default="eomt_cityscapes_semantic.pth")
+    parser.add_argument("--subset", default="val")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
-    # Liste per salvare i risultati
+    # Liste risultati
     anomaly_score_list = []
     ood_gts_list = []
 
-    modelpath = args.loadDir + args.loadModel
-    weightspath = args.loadDir + args.loadWeights
+    if not os.path.exists("results_rba.txt"):
+        open("results_rba.txt", "w").close()
+    file = open("results_rba.txt", "a")
 
-    print(f"Loading model: {modelpath}")
+    # -------------------------------
+    # CARICAMENTO MODELLO
+    # -------------------------------
+    weightspath = os.path.join(args.loadDir, args.loadWeights)
     print(f"Loading weights: {weightspath}")
 
-    model = ERFNet(NUM_CLASSES)
+    encoder = ViT(img_size=(512, 1024), backbone_name=BACKBONE_NAME)
+    model = EoMT(
+        encoder=encoder,
+        num_classes=NUM_CLASSES,
+        num_q=NUM_Q,
+        num_blocks=NUM_BLOCKS,
+        masked_attn_enabled=False
+    )
+
     if not args.cpu:
-        model = torch.nn.DataParallel(model).cuda()
+        model = model.cuda()
 
-    # Caricamento pesi custom
-    def load_my_state_dict(model, state_dict):
-        own_state = model.state_dict()
-        for name, param in state_dict.items():
-            if name not in own_state:
-                if name.startswith("module."):
-                    own_state[name.split("module.")[-1]].copy_(param)
-            else:
-                own_state[name].copy_(param)
-        return model
+    # Caricamento pesi
+    checkpoint = torch.load(weightspath, map_location="cpu")
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
 
-    model = load_my_state_dict(model, torch.load(weightspath, map_location=lambda storage, loc: storage))
+    # Pulizia chiavi state_dict
+    own_state = model.state_dict()
+    for name, param in state_dict.items():
+        if name not in own_state:
+            # Gestione prefisso "module."
+            if name.startswith("module.") and name.split("module.")[-1] in own_state:
+                own_state[name.split("module.")[-1]].copy_(param)
+        else:
+            own_state[name].copy_(param)
+    
+    print("Model loaded successfully for RbA evaluation.")
     model.eval()
-    
-    # --- CICLO DI INFERENZA ---
-    print(f"Processing {len(glob.glob(os.path.expanduser(str(args.input[0]))))} images...")
-    
-    for path in glob.glob(os.path.expanduser(str(args.input[0]))):
-        
-        # Carica e trasforma immagine
-        img_pil = Image.open(path).convert('RGB')
-        images = input_transform(img_pil).unsqueeze(0).float().cuda()
-        
-        B, C, H, W = images.shape
-        masks = get_rba_masks(H, W, images.device)
-        
-        accumulated_probs = torch.zeros((B, NUM_CLASSES, H, W)).cuda()
-        count_transforms = 0
+
+    # -------------------------------
+    # INFERENZA
+    # -------------------------------
+    # Espansione glob pattern
+    image_paths = []
+    for pattern in args.input:
+        image_paths.extend(glob.glob(os.path.expanduser(pattern)))
+
+    print(f"Processing {len(image_paths)} images...")
+
+    for path in image_paths:
+        # 1. Prepare Input
+        img_pil = Image.open(path).convert("RGB")
+        images = input_transform(img_pil).unsqueeze(0).float()
+        if not args.cpu:
+            images = images.cuda()
 
         with torch.no_grad():
-            for mask in masks:
-                # 1. Immagine Mascherata
-                masked_input = images * mask
-                logits = model(masked_input)
-                probs = torch.nn.functional.softmax(logits, dim=1)
-                accumulated_probs += probs
-                count_transforms += 1
-                
-                # 2. Immagine Mascherata + FLIP
-                masked_input_flip = torch.flip(masked_input, dims=[3])
-                logits_flip = model(masked_input_flip)
-                logits_flip = torch.flip(logits_flip, dims=[3]) # Flip back
-                probs_flip = torch.nn.functional.softmax(logits_flip, dim=1)
-                accumulated_probs += probs_flip
-                count_transforms += 1
-        
-        # --- RbA Logic: Calcolo Entropia sulla Media ---
-        mean_probs = accumulated_probs / count_transforms
-        
-        # Calcolo Entropia
-        log_prob_mean = torch.log(mean_probs + 1e-10)
-        entropy_tensor = -torch.sum(mean_probs * log_prob_mean, dim=1)
-        entropy_score = entropy_tensor.squeeze(0).data.cpu().numpy()
+            # 2. Forward Pass
+            # Otteniamo i logits grezzi dal modello (Mask Transformer)
+            mask_logits_per_layer, class_logits_per_layer = model(images)
+            
+            # Usiamo l'output dell'ultimo layer
+            mask_logits = mask_logits_per_layer[-1]    # [B, Q, H_feat, W_feat]
+            class_logits = class_logits_per_layer[-1]  # [B, Q, K+1] (K classi + void/no-object)
 
-        # --- Gestione Ground Truth (Label) ---
-        pathGT = path.replace("images", "labels_masks")                
+            # ---------------------------------------------------------
+            # IMPLEMENTAZIONE RbA (Rejected by All) SCORING
+            # ---------------------------------------------------------
+            # RbA si basa sulle probabilità reali, non sui logits grezzi combinati.
+            
+            # A. Probabilità di Classe per ogni Query: Softmax su K+1 classi
+            #    Shape: [B, Q, K+1]
+            class_probs = F.softmax(class_logits, dim=-1)
+            
+            # B. Probabilità della Maschera per ogni Query: Sigmoid
+            #    Shape: [B, Q, H_feat, W_feat]
+            mask_probs = torch.sigmoid(mask_logits)
+            
+            # C. Calcolo della Mappa di Probabilità Semantica per le Classi NOTE
+            #    P(class=c | pixel) = Sum_over_Queries ( P(class=c|query) * P(mask|query) )
+            #    Consideriamo solo le prime NUM_CLASSES (escludiamo l'ultima classe "void" dai logit di classe)
+            #    Shape risultante: [B, NUM_CLASSES, H_feat, W_feat]
+            
+            # Selezioniamo solo le probabilità delle classi in-distribution (0...K-1)
+            class_probs_known = class_probs[..., :NUM_CLASSES] 
+            
+            # Moltiplicazione matriciale (einsum) per aggregare le query
+            prob_map_known = torch.einsum("bqc,bqhw->bchw", class_probs_known, mask_probs)
+            
+            # D. Calcolo Score RbA
+            #    RbA definisce l'anomalia come "essere rifiutato da tutte le classi note".
+            #    Score = 1.0 - Somma(Probabilità di tutte le classi note)
+            #    Questo è matematicamente equivalente alla probabilità assegnata alla classe "void" 
+            #    o "residua" dal modello.
+            
+            # Somma su tutte le classi note -> [B, H_feat, W_feat]
+            total_known_prob = torch.sum(prob_map_known, dim=1)
+            
+            # Score finale (più alto = più anomalo)
+            rba_score_map = 1.0 - total_known_prob
+
+            # Interpolazione alla risoluzione originale (512, 1024)
+            rba_score_map = F.interpolate(
+                rba_score_map.unsqueeze(1), # Aggiungi dim canali per interpolate
+                size=(512, 1024), 
+                mode="bilinear", 
+                align_corners=False
+            ).squeeze(1) # Rimuovi dim canali
+            
+            # Converti in numpy per metriche
+            anomaly_score = rba_score_map.squeeze(0).cpu().numpy()
+
+        # -------------------------------
+        # CARICAMENTO GROUND TRUTH (GT)
+        # -------------------------------
+        pathGT = path.replace("images", "labels_masks")
         if "RoadObsticle21" in pathGT: pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT: pathGT = pathGT.replace("jpg", "png")                
-        if "RoadAnomaly" in pathGT: pathGT = pathGT.replace("jpg", "png")  
-
-        if not os.path.exists(pathGT):
-            # Fallback per estensioni diverse se necessario
-            pathGT = pathGT.replace(".png", ".jpg") 
+        if "fs_static" in pathGT: pathGT = pathGT.replace("jpg", "png")
+        if "RoadAnomaly" in pathGT: pathGT = pathGT.replace("jpg", "png")
         
+        # Fallback estensione
+        if not os.path.exists(pathGT):
+            pathGT = pathGT.replace(".png", ".jpg")
+
         try:
             mask_gt = Image.open(pathGT)
             mask_gt = target_transform(mask_gt)
             ood_gts = np.array(mask_gt)
 
-            # Mappatura etichette per i vari dataset
+            # Mappatura etichette OOD specifica per dataset
             if "RoadAnomaly" in pathGT:
-                ood_gts = np.where((ood_gts==2), 1, ood_gts)
+                ood_gts = np.where((ood_gts == 2), 1, ood_gts)
             if "LostAndFound" in pathGT:
-                ood_gts = np.where((ood_gts==0), 255, ood_gts)
-                ood_gts = np.where((ood_gts==1), 0, ood_gts)
-                ood_gts = np.where((ood_gts>1)&(ood_gts<201), 1, ood_gts)
+                ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+                ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+                ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
             if "Streethazard" in pathGT:
-                ood_gts = np.where((ood_gts==14), 255, ood_gts)
-                ood_gts = np.where((ood_gts<20), 0, ood_gts)
-                ood_gts = np.where((ood_gts==255), 1, ood_gts)
+                ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+                ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+                ood_gts = np.where((ood_gts == 255), 1, ood_gts)
 
             if 1 not in np.unique(ood_gts):
                 continue
             
             ood_gts_list.append(ood_gts)
-            anomaly_score_list.append(entropy_score) # RbA usa score basato su Entropia
+            anomaly_score_list.append(anomaly_score)
 
         except Exception as e:
-            print(f"Skipping {path}: {e}")
+            print(f"Error loading GT for {path}: {e}")
             continue
 
-        # Pulizia memoria
-        del accumulated_probs, mean_probs, entropy_tensor, images
+        # Memory Cleanup
+        del mask_logits, class_logits, prob_map_known, rba_score_map, total_known_prob
         torch.cuda.empty_cache()
 
-    # --- Calcolo Metriche Finali ---
+    # -------------------------------
+    # CALCOLO METRICHE FINALI
+    # -------------------------------
+    print("Calculating Metrics...")
     ood_gts = np.array(ood_gts_list)
     anomaly_scores = np.array(anomaly_score_list)
 
+    # Flattening
     ood_mask = (ood_gts == 1)
     ind_mask = (ood_gts == 0)
 
@@ -186,14 +238,18 @@ def main():
     val_out = np.concatenate((ind_out, ood_out))
     val_label = np.concatenate((np.zeros(len(ind_out)), np.ones(len(ood_out))))
 
+    # Metriche
     prc_auc = average_precision_score(val_label, val_out)
     fpr = fpr_at_95_tpr(val_out, val_label)
 
-    print("\n" + "="*30)
-    print(f"RESULTS FOR RbA")
-    print(f"AuPRC: {prc_auc*100.0:.2f}")
-    print(f"FPR@95: {fpr*100.0:.2f}")
-    print("="*30 + "\n")
+    print(f"RbA Results for {args.input}:")
+    print(f"  AUPRC score: {prc_auc * 100.0:.2f}")
+    print(f"  FPR@TPR95:   {fpr * 100.0:.2f}")
 
-if __name__ == '__main__':
+    file.write(f"\nResults for {args.input}:\n")
+    file.write(f"  AUPRC score RbA: {prc_auc * 100.0}\n")
+    file.write(f"  FPR@TPR95 RbA:   {fpr * 100.0}\n")
+    file.close()
+
+if __name__ == "__main__":
     main()
