@@ -18,11 +18,11 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, CenterCrop, Normalize, Resize
 from torchvision.transforms import ToTensor, ToPILImage
 
-from eval.dataset import cityscapes
-from models.vit import ViT
-from models.eomt import EoMT
-from eval.transform import Relabel, ToLabel, Colorize
-from eval.iouEval import iouEval, getColorEntry
+from dataset import cityscapes
+from eomt.models.vit import ViT
+from eomt.models.eomt import EoMT
+from transform import Relabel, ToLabel, Colorize
+from iouEval import iouEval, getColorEntry
 
 NUM_CHANNELS = 3
 NUM_CLASSES = 19 
