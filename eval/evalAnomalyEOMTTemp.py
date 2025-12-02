@@ -78,7 +78,7 @@ def main():
     # Target values required by table: 0.5, 0.75, 1.1
     # Search values for 'Best T': generic range around 1.0
     target_temps = [0.5, 0.75, 1.0, 1.1] 
-    search_temps = [0.3, 0.9, 1.2, 1.3, 1.5, 2.0]
+    search_temps = [0.1, 0.2, 0.3, 0.9, 1.2, 1.3, 1.5, 2.0, 2.3, 2.5, 3.0, 4.0, 5.0]
     all_temps = sorted(list(set(target_temps + search_temps)))
 
     # Dizionario per accumulare gli score: { 0.5: [], 0.75: [], ... }
@@ -245,7 +245,7 @@ def main():
         prefix = " "
         if t in [0.5, 0.75, 1.1]: prefix = "*" # Evidenzia quelli richiesti specificamente
         
-        print(f"{prefix} T = {t:<4} | AuPRC: {prc_auc*100.0:.2f} | FPR@95: {fpr*100.0:.2f}")
+        print(f"{prefix} T = {t:<4} | AuPRC: {prc_auc*100.0} | FPR@95: {fpr*100.0}")
 
         # Check Best T
         if prc_auc > best_auprc:
@@ -253,7 +253,7 @@ def main():
             best_t = t
 
     print("-" * 50)
-    print(f"BEST T FOUND: {best_t} (AuPRC: {best_auprc*100.0:.2f})")
+    print(f"BEST T FOUND: {best_t} (AuPRC: {best_auprc*100.0})")
     print("-" * 50)
 
 if __name__ == "__main__":
