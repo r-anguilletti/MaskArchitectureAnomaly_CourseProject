@@ -243,8 +243,8 @@ def main():
     fpr = fpr_at_95_tpr(val_out, val_label)
 
     print(f"RbA Results for {args.input}:")
-    print(f"  AUPRC score: {prc_auc * 100.0:.2f}")
-    print(f"  FPR@TPR95:   {fpr * 100.0:.2f}")
+    print(f"  AUPRC score: {prc_auc * 100.0}")
+    print(f"  FPR@TPR95:   {fpr * 100.0}")
 
     file.write(f"\nResults for {args.input}:\n")
     file.write(f"  AUPRC score RbA: {prc_auc * 100.0}\n")
