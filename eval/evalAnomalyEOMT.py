@@ -8,7 +8,7 @@ import random
 from PIL import Image
 import numpy as np
 
-import cv2  # usato solo se ti serve salvare visualizzazioni, altrimenti puoi rimuoverlo
+#import cv2  # usato solo se ti serve salvare visualizzazioni, altrimenti puoi rimuoverlo
 
 import os.path as osp
 from argparse import ArgumentParser
