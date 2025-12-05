@@ -168,7 +168,7 @@ def main():
     # Target per tabella: 0.5, 0.75, 1.1
     # Search values per 'best T'
     target_temps = [0.5, 0.75, 1.0, 1.1]
-    search_temps = [0.1, 0.2, 0.3, 0.9, 1.2, 1.3, 1.5, 2.0, 2.3, 2.5, 3.0, 4.0, 5.0]
+    search_temps = [0.3, 0.9, 1.2, 1.5, 2.0, 2.5, 3.0, 5.0, 7.0, 10.0, 11.0]
     all_temps = sorted(list(set(target_temps + search_temps)))
 
     # Dizionario: {T: [anomaly_map_img0, anomaly_map_img1, ...]}
@@ -326,7 +326,7 @@ def main():
         if t in [0.5, 0.75, 1.1]:
             prefix = "*"
 
-        print(f"{prefix} T = {t:<4} | AuPRC: {prc_auc * 100.0:.2f} | FPR@95: {fpr * 100.0:.2f}")
+        print(f"{prefix} T = {t:<4} | AuPRC: {prc_auc * 100.0:.6f} | FPR@95: {fpr * 100.0:.6f}")
 
         if prc_auc > best_auprc:
             best_auprc = prc_auc
