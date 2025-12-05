@@ -168,7 +168,7 @@ def main():
     # Target per tabella: 0.5, 0.75, 1.1
     # Search values per 'best T'
     target_temps = [0.5, 0.75, 1.0, 1.1]
-    search_temps = [0.3, 0.9, 1.2, 1.5, 2.0, 2.5, 3.0, 5.0, 7.0, 10.0, 11.0]
+    search_temps = [0.3, 1.2, 2.0, 5.0, 7.0, 10.0, 11.0]
     all_temps = sorted(list(set(target_temps + search_temps)))
 
     # Dizionario: {T: [anomaly_map_img0, anomaly_map_img1, ...]}
@@ -311,6 +311,7 @@ def main():
     # Stampa tipo tabella:
     #  T | AuPRC | FPR@95
     for t in all_temps:
+        print(f"Computing metrics for T={t} ...")
         scores_all = np.array(anomaly_scores_dict[t])
 
         # Estraggo i valori solo sui pixel validi
