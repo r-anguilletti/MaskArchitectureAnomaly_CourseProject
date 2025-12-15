@@ -14,7 +14,7 @@ from scipy.ndimage import gaussian_filter
 from models.segmenter import AnomalySegmenter
 
 # --- CONFIGURAZIONE ---
-IMG_SIZE = (518, 518)
+IMG_SIZE = (336, 336)
 NUM_CLASSES = 19
 
 # Trasformazioni

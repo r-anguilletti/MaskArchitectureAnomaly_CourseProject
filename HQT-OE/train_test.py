@@ -21,9 +21,9 @@ LOG_DIR = "/content/drive/MyDrive/AnomalyProject/logs"
 BATCH_SIZE = 2        # Aumentato da 2 a 4 (Prova 4, se va OOM torna a 2)
 NUM_WORKERS = 2       # Aumentato da 2 a 4 (Sfrutta tutta la CPU di Colab)
 ACCUMULATE_GRAD = 1   # Ridotto a 1 perché il batch reale è già 4
-IMG_SIZE = (518, 518)
+IMG_SIZE = (336, 336)
 MAX_EPOCHS = 6
-LR = 5e-5             
+LR = 1e-4             
 
 # --- DEFINIZIONE CLASSI ---
 NUM_CLASSES = 20      
