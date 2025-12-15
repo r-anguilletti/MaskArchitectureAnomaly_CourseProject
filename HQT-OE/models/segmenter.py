@@ -1,7 +1,3 @@
-
-Contenuti in evidenza della cartella
-Codice Python per AnomalySegmenter che implementa ViT ed EoMT con logica LoRA per la segmentazione.
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,16 +52,19 @@ class AnomalySegmenter(L.LightningModule):
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
         # --------------------------------------------------
-        # METRICHE (NO ANOMALY)
+        # METRICHE
         # --------------------------------------------------
-        # Calcoliamo IoU solo sulle classi 'normali' (0-18)
+        # FIX: Inizializziamo la metrica con TUTTE le classi (20).
+        # Se mascheriamo la classe 19 e la metrica se ne aspetta 19 (0-18), 
+        # crasha se arriva un 19 o se la matrice di confusione sballa.
+        # Calcolando su tutte le classi abbiamo anche l'IoU dell'anomalia, che è utile.
         self.train_iou = MulticlassJaccardIndex(
-            num_classes=num_classes - 1,   
+            num_classes=num_classes,   # Ora 20
             ignore_index=self.ignore_index,
             average="macro"
         )
         self.val_iou = MulticlassJaccardIndex(
-            num_classes=num_classes - 1,
+            num_classes=num_classes,   # Ora 20
             ignore_index=self.ignore_index,
             average="macro"
         )
@@ -129,51 +128,48 @@ class AnomalySegmenter(L.LightningModule):
         return seg
 
     # ==================================================
-    # TRAINING STEP (PATCHATO)
+    # TRAINING STEP
     # ==================================================
     def training_step(self, batch, batch_idx):
         img, mask = batch
         seg_logits = self(img).float()
 
         # -------------------------
-        # 1. CE LOSS (ANTI-NAN FIX)
+        # 1. CE LOSS (Standard Classes)
         # -------------------------
         mask_ce = mask.clone()
         # Nascondiamo l'anomalia alla CE (deve imparare solo le classi normali)
+        # L'anomalia viene imparata tramite Energy Loss, non CE diretta.
         mask_ce[mask_ce == self.anomaly_class_idx] = self.ignore_index
         
-        # Conta quanti pixel validi ci sono (che non siano 255)
         valid_pixels = (mask_ce != self.ignore_index).sum()
         
         if valid_pixels > 0:
             loss_ce = self.ce_loss(seg_logits, mask_ce)
         else:
-            # Se il batch contiene SOLO anomalie e ignore, la CE loss esplode (div/0).
-            # Restituiamo 0.0 con requires_grad=True per non rompere il grafo.
             loss_ce = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # -------------------------
-        # 2. ENERGY LOSS (OOD)
+        # 2. ENERGY LOSS (Anomaly / OOD)
         # -------------------------
         loss_energy = self._energy_loss(seg_logits, mask)
 
         total_loss = loss_ce + 0.1 * loss_energy
 
         # -------------------------
-        # 3. METRICA SICURA (ANTI-CRASH FIX)
+        # 3. METRICA IOU
         # -------------------------
         preds = torch.argmax(seg_logits, dim=1)
-        preds_id = preds.clone()
-        preds_id[preds_id == self.anomaly_class_idx] = self.ignore_index
-
-        mask_id = mask.clone()
-        mask_id[mask_id == self.anomaly_class_idx] = self.ignore_index
-
-        # FILTRO MANUALE: Passiamo alla metrica solo i pixel validi (non 255)
-        # Altrimenti torchmetrics cerca di creare una matrice enorme e crasha.
-        valid_mask = (mask_id != self.ignore_index)
+        
+        # FIX: Passiamo direttamente le predizioni e la maschera alla metrica.
+        # La metrica ora è configurata per 20 classi, quindi accetta anche l'ID 19.
+        # Non c'è bisogno di mascherare l'anomalia qui, anzi è utile vederne l'IoU.
+        
+        # Unica accortezza: Filtriamo SOLO i pixel veramente ignorati (255) dal dataset
+        valid_mask = (mask != self.ignore_index)
+        
         if valid_mask.any():
-            self.train_iou(preds_id[valid_mask], mask_id[valid_mask])
+            self.train_iou(preds[valid_mask], mask[valid_mask])
 
         self.log_dict(
             {
@@ -193,11 +189,8 @@ class AnomalySegmenter(L.LightningModule):
     # ==================================================
     def _energy_loss(self, seg_logits, mask):
         T = 1.0
-        # LogSumExp sulle classi in-distribution
-        # Nota: seg_logits ha 20 canali, usiamo tutti per il calcolo dell'energia
-        # ma l'obiettivo è spingere giù l'energia delle anomalie.
         
-        # Prendiamo solo i logit delle classi ID (0-18)
+        # Prendiamo solo i logit delle classi ID (0-18) per il calcolo dell'energia
         id_logits = seg_logits[:, :self.anomaly_class_idx, :, :]
         energy = -torch.logsumexp(id_logits / T, dim=1)
 
@@ -215,13 +208,13 @@ class AnomalySegmenter(L.LightningModule):
         return loss
 
     # ==================================================
-    # VALIDATION STEP (PATCHATO)
+    # VALIDATION STEP
     # ==================================================
     def validation_step(self, batch, batch_idx):
         img, mask = batch
         seg_logits = self(img).float()
 
-        # Fix Anti-Nan anche in validazione
+        # Calcolo Loss (Solo per monitoraggio, uguale al train)
         mask_ce = mask.clone()
         mask_ce[mask_ce == self.anomaly_class_idx] = self.ignore_index
         
@@ -231,11 +224,10 @@ class AnomalySegmenter(L.LightningModule):
         else:
             val_loss = torch.tensor(0.0, device=self.device)
 
-        # Fix Metrica
+        # Calcolo Metrica
         preds = torch.argmax(seg_logits, dim=1)
-        preds[preds == self.anomaly_class_idx] = self.ignore_index
-        mask[mask == self.anomaly_class_idx] = self.ignore_index
-
+        
+        # FIX: Anche qui, passiamo tutto alla metrica (classe 19 inclusa)
         valid_mask = (mask != self.ignore_index)
         if valid_mask.any():
             self.val_iou(preds[valid_mask], mask[valid_mask])
@@ -262,7 +254,7 @@ class AnomalySegmenter(L.LightningModule):
         )
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt,
-            T_max=100, # Adatta alle tue epoche totali stimate
+            T_max=100,
             eta_min=1e-6
         )
         return {
