@@ -1,8 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
 
-from datasets.hybrid_anomaly_dataset import HybridAnomalyDataset
-from models.anomaly_segmenter import AnomalySegmenter
+from datasets.hybrid_anomaly import HybridAnomalyDataset
+from models.segmenter import AnomalySegmenter
 
 
 # ============================================================
@@ -30,12 +30,12 @@ loader = DataLoader(
     dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
-    num_workers=0,     # IMPORTANT: zero per debug
+    num_workers=0,   # ZERO per debug
     pin_memory=True,
 )
 
-batch = next(iter(loader))
-imgs, masks = batch
+# Prendiamo un batch valido
+imgs, masks = next(iter(loader))
 
 print(f"🖼 Image batch shape: {imgs.shape}")
 print(f"🧩 Mask batch shape : {masks.shape}")
@@ -67,22 +67,28 @@ with torch.autocast(device_type=DEVICE, enabled=(DEVICE == "cuda")):
 
 print(f"🔢 Logits shape: {seg_logits.shape}")
 
-assert seg_logits.shape[:2] == (BATCH_SIZE, 20)
-assert seg_logits.shape[-2:] == IMG_SIZE
+assert seg_logits.shape == (BATCH_SIZE, 20, IMG_SIZE[0], IMG_SIZE[1])
 
 
 # ============================================================
-# LOSS
+# LOSS (ROBUSTA)
 # ============================================================
 print("📉 Computing losses...")
 seg_logits_fp32 = seg_logits.float()
 
-# CE (in-distribution only)
+# ---- CE solo in-distribution ----
 mask_ce = masks.clone()
-mask_ce[mask_ce == 19] = 255
+mask_ce[mask_ce == 19] = 255  # anomaly → ignore
 
-loss_ce = model.ce_loss(seg_logits_fp32, mask_ce)
+if (mask_ce != 255).any():
+    loss_ce = model.ce_loss(seg_logits_fp32, mask_ce)
+else:
+    print("⚠️ No in-distribution pixels in batch → CE skipped")
+    loss_ce = torch.tensor(0.0, device=DEVICE)
+
+# ---- Energy loss ----
 loss_energy = model._energy_loss(seg_logits_fp32, masks)
+
 loss = loss_ce + 0.1 * loss_energy
 
 print(f"✅ CE loss     : {loss_ce.item():.4f}")
@@ -98,7 +104,6 @@ assert torch.isfinite(loss), "❌ LOSS IS NaN / INF"
 print("🔄 Backward pass...")
 loss.backward()
 
-# Check gradients (LoRA + heads)
 grad_ok = False
 for name, p in model.named_parameters():
     if p.requires_grad and p.grad is not None:
@@ -115,7 +120,12 @@ assert grad_ok, "❌ No gradients flowing!"
 print("🧠 Energy map sanity...")
 energy_map = -torch.logsumexp(seg_logits_fp32, dim=1)
 
-print(f"Energy stats: min={energy_map.min():.2f}, max={energy_map.max():.2f}")
+print(
+    f"Energy stats → "
+    f"min={energy_map.min():.2f}, "
+    f"max={energy_map.max():.2f}, "
+    f"mean={energy_map.mean():.2f}"
+)
 
 assert torch.isfinite(energy_map).all()
 
@@ -126,4 +136,5 @@ assert torch.isfinite(energy_map).all()
 print("\n🎉 SANITY CHECK PASSED")
 print("✔ Architecture works")
 print("✔ Forward / Loss / Backward OK")
-print("✔ Dataset ↔ Model coherent")
+print("✔ Energy-based anomaly formulation OK")
+print("✔ Dataset ↔ Model 100% coherent")

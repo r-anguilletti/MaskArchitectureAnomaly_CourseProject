@@ -192,7 +192,7 @@ class HybridAnomalyDataset(Dataset):
         # --------------------------------------------------
         # INIEZIONE ANOMALIA (COCO)
         # --------------------------------------------------
-        if random.random() < 1.0:
+        if random.random() < 0.7:
             for _ in range(5):
                 coco_idx = random.randint(0, len(self.coco_ds) - 1)
                 anom_img, anom_target = self.coco_ds[coco_idx]
