@@ -1,266 +1,331 @@
+# models/segmenter.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
-from peft import LoraConfig, get_peft_model
 from torchmetrics.classification import MulticlassJaccardIndex
+from peft import LoraConfig, get_peft_model
 
 from models.vit import ViT
 from models.eomt import EoMT
 
 
 class AnomalySegmenter(L.LightningModule):
+    """
+    Stable segmenter:
+      - Cityscapes: CE on ID classes (0..C-1)
+      - OE cut&paste: Energy-based separation
+      - Balanced Energy Regularization (CVPR'23 style): focuses harder OOD pixels
+
+    Outputs:
+      - forward(x) -> ID logits (B,C,H,W)
+      - anomaly_score(x) -> energy map (B,H,W)
+    """
+
     def __init__(
         self,
         img_size=(518, 518),
-        num_classes=20,                 # include anomaly slot (0-18 + 19)
-        anomaly_class_idx=19,
+        num_id_classes=19,
         ignore_index=255,
         lr=5e-5,
         weight_decay=1e-2,
         backbone_name="vit_large_patch14_reg4_dinov2",
+        # Energy setup
+        T=1.0,
+        m_in=-12.0,
+        m_out=-6.0,
+        lambda_energy=0.1,
+        # Balanced energy (paper-inspired)
+        use_balanced_energy=True,
+        gamma=3.0,     # controls "peakedness" of Z_gamma
+        alpha=5.0,     # margin amplification for hard OOD
+        prior_momentum=0.99,  # EMA update for p(y|o)
+        # LoRA
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        lora_target_modules=("qkv",),
+        modules_to_save=("class_head", "mask_head"),
+        # Stability
+        clamp_logits=10.0,
+        grad_clip_hint=0.5,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.num_classes = num_classes
-        self.anomaly_class_idx = anomaly_class_idx
+        self.num_id_classes = num_id_classes
         self.ignore_index = ignore_index
 
-        # --------------------------------------------------
-        # ARCHITETTURA
-        # --------------------------------------------------
-        self.encoder = ViT(
-            img_size=img_size,
-            backbone_name=backbone_name,
-            patch_size=14
-        )
-        self.base_model = EoMT(
-            encoder=self.encoder,
-            num_classes=num_classes,
-            num_q=100,
-            num_blocks=4
-        )
-        self._setup_lora()
+        self.lr = lr
+        self.weight_decay = weight_decay
 
-        # --------------------------------------------------
-        # LOSS
-        # --------------------------------------------------
-        # ignore_index gestito manualmente nel training_step per evitare NaN
+        self.T = float(T)
+        self.m_in = float(m_in)
+        self.m_out = float(m_out)
+        self.lambda_energy = float(lambda_energy)
+
+        self.use_balanced_energy = bool(use_balanced_energy)
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
+        self.prior_momentum = float(prior_momentum)
+
+        self.clamp_logits = float(clamp_logits)
+
+        # ----------------------------
+        # Architecture (ID-only)
+        # ----------------------------
+        self.encoder = ViT(img_size=img_size, backbone_name=backbone_name, patch_size=14)
+        self.base_model = EoMT(encoder=self.encoder, num_classes=num_id_classes, num_q=100, num_blocks=4)
+
+        self._setup_lora(
+            r=lora_r,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+            target_modules=list(lora_target_modules),
+            modules_to_save=list(modules_to_save),
+        )
+
+        # ----------------------------
+        # Loss / Metrics
+        # ----------------------------
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
-        # --------------------------------------------------
-        # METRICHE
-        # --------------------------------------------------
-        # FIX: Inizializziamo la metrica con TUTTE le classi (20).
-        # Se mascheriamo la classe 19 e la metrica se ne aspetta 19 (0-18), 
-        # crasha se arriva un 19 o se la matrice di confusione sballa.
-        # Calcolando su tutte le classi abbiamo anche l'IoU dell'anomalia, che è utile.
-        self.train_iou = MulticlassJaccardIndex(
-            num_classes=num_classes,   # Ora 20
+        self.train_miou = MulticlassJaccardIndex(
+            num_classes=num_id_classes,
             ignore_index=self.ignore_index,
             average="macro"
         )
-        self.val_iou = MulticlassJaccardIndex(
-            num_classes=num_classes,   # Ora 20
+        self.val_miou = MulticlassJaccardIndex(
+            num_classes=num_id_classes,
             ignore_index=self.ignore_index,
             average="macro"
         )
 
-    # ==================================================
+        # Running estimate of p(y|o) for balanced energy (1D vector, size C)
+        # Start uniform to avoid weird early bias.
+        prior = torch.ones(num_id_classes, dtype=torch.float32) / float(num_id_classes)
+        self.register_buffer("ood_prior", prior)
+
+    # ----------------------------
     # LoRA
-    # ==================================================
-    def _setup_lora(self):
+    # ----------------------------
+    def _setup_lora(self, r, alpha, dropout, target_modules, modules_to_save):
         peft_config = LoraConfig(
-            r=8,
-            lora_alpha=16,
-            lora_dropout=0.05,
-            target_modules=["qkv"],
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
             bias="none",
-            modules_to_save=[
-                "class_head", "mask_head",
-                "upscale", "conv1", "conv2"
-            ],
+            modules_to_save=modules_to_save,
         )
         self.model = get_peft_model(self.base_model, peft_config)
 
-    # ==================================================
-    # FORWARD
-    # ==================================================
+    # ----------------------------
+    # Forward: ID logits
+    # ----------------------------
     def forward(self, x):
         mask_logits_list, class_logits_list = self.model(x)
+        mask_logits = mask_logits_list[-1]     # (B,Q,Hp,Wp)
+        class_logits = class_logits_list[-1]   # (B,Q,C) or (B,Q,C+1)
 
-        mask_logits = mask_logits_list[-1]
-        class_logits = class_logits_list[-1]
-
-        seg_logits = self._build_segmentation_logits(
-            mask_logits,
-            class_logits,
-            target_hw=(x.shape[-2], x.shape[-1])
-        )
-
-        # Sicurezza numerica: clampiamo i logit finali per evitare esplosioni
-        return seg_logits.clamp(-10.0, 10.0)
+        seg_logits = self._build_segmentation_logits(mask_logits, class_logits, target_hw=(x.shape[-2], x.shape[-1]))
+        if self.clamp_logits > 0:
+            seg_logits = seg_logits.clamp(-self.clamp_logits, self.clamp_logits)
+        return seg_logits
 
     def _build_segmentation_logits(self, mask_logits, class_logits, target_hw):
         B, Q, Hp, Wp = mask_logits.shape
-        C = class_logits.shape[-1] - 1   # esclude no-object
+        C_eff = class_logits.shape[-1]
 
-        class_logits = class_logits[..., :C].permute(0, 2, 1)
-        mask_logits = mask_logits
+        # Drop no-object if present
+        if C_eff == self.num_id_classes + 1:
+            class_logits = class_logits[..., : self.num_id_classes]
+        else:
+            class_logits = class_logits[..., : self.num_id_classes]
 
-        # Clamp intermedio cruciale per stabilità FP16
+        # (B,Q,C)->(B,C,Q)
+        class_logits = class_logits.permute(0, 2, 1)
+
         seg_flat = torch.bmm(
-            class_logits.clamp(-10, 10),
-            mask_logits.view(B, Q, -1).clamp(-10, 10)
+            class_logits.clamp(-self.clamp_logits, self.clamp_logits),
+            mask_logits.view(B, Q, -1).clamp(-self.clamp_logits, self.clamp_logits),
         )
-        seg = seg_flat.view(B, C, Hp, Wp)
+        seg = seg_flat.view(B, self.num_id_classes, Hp, Wp)
 
         if (Hp, Wp) != target_hw:
-            seg = F.interpolate(
-                seg,
-                size=target_hw,
-                mode="bilinear",
-                align_corners=False
-            )
+            seg = F.interpolate(seg, size=target_hw, mode="bilinear", align_corners=False)
         return seg
 
-    # ==================================================
-    # TRAINING STEP
-    # ==================================================
-    def training_step(self, batch, batch_idx):
-        img, mask = batch
-        seg_logits = self(img).float()
+    # ----------------------------
+    # Energy
+    # ----------------------------
+    def energy_map(self, logits):
+        # E = -T logsumexp(logits/T)
+        return -self.T * torch.logsumexp(logits / self.T, dim=1)
 
-        # -------------------------
-        # 1. CE LOSS (Standard Classes)
-        # -------------------------
-        mask_ce = mask.clone()
-        # Nascondiamo l'anomalia alla CE (deve imparare solo le classi normali)
-        # L'anomalia viene imparata tramite Energy Loss, non CE diretta.
-        mask_ce[mask_ce == self.anomaly_class_idx] = self.ignore_index
-        
-        valid_pixels = (mask_ce != self.ignore_index).sum()
-        
-        if valid_pixels > 0:
-            loss_ce = self.ce_loss(seg_logits, mask_ce)
-        else:
-            loss_ce = torch.tensor(0.0, device=self.device, requires_grad=True)
+    @torch.no_grad()
+    def _update_ood_prior(self, logits, oe_mask01):
+        """
+        Update EMA estimate of p(y|o) using OOD pixels only.
+        """
+        out_mask = (oe_mask01 == 1)
+        if not out_mask.any():
+            return
 
-        # -------------------------
-        # 2. ENERGY LOSS (Anomaly / OOD)
-        # -------------------------
-        loss_energy = self._energy_loss(seg_logits, mask)
+        # probs over ID classes
+        probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
+        # mean distribution across OOD pixels
+        p = probs.permute(0, 2, 3, 1)[out_mask].mean(dim=0)  # (C,)
+        if torch.isnan(p).any():
+            return
 
-        total_loss = loss_ce + 0.1 * loss_energy
+        m = self.prior_momentum
+        self.ood_prior.mul_(m).add_((1.0 - m) * p)
 
-        # -------------------------
-        # 3. METRICA IOU
-        # -------------------------
-        preds = torch.argmax(seg_logits, dim=1)
-        
-        # FIX: Passiamo direttamente le predizioni e la maschera alla metrica.
-        # La metrica ora è configurata per 20 classi, quindi accetta anche l'ID 19.
-        # Non c'è bisogno di mascherare l'anomalia qui, anzi è utile vederne l'IoU.
-        
-        # Unica accortezza: Filtriamo SOLO i pixel veramente ignorati (255) dal dataset
-        valid_mask = (mask != self.ignore_index)
-        
-        if valid_mask.any():
-            self.train_iou(preds[valid_mask], mask[valid_mask])
+        # keep normalized
+        s = self.ood_prior.sum().clamp_min(1e-6)
+        self.ood_prior.div_(s)
 
-        self.log_dict(
-            {
-                "train_loss": total_loss,
-                "train_ce": loss_ce,
-                "train_energy": loss_energy,
-                "train_mIoU": self.train_iou,
-            },
-            prog_bar=True,
-            on_epoch=True,
-        )
+    def _balanced_weights(self, logits, oe_mask01):
+        """
+        Paper-inspired "hardness" weight for OOD pixels:
+          Z(x) = sum_j p(y=j|x) * p(y=j|o)
+          Z_gamma = normalize( Z(x)^gamma )
+        Returns:
+          w_out: (B,H,W) weights (only meaningful on OOD pixels, else 0)
+        """
+        out_mask = (oe_mask01 == 1)
+        B, C, H, W = logits.shape
+        w = torch.zeros((B, H, W), device=logits.device, dtype=logits.dtype)
+        if not out_mask.any():
+            return w
 
-        return total_loss
+        probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
+        prior = self.ood_prior.view(1, C, 1, 1).to(probs.dtype)  # (1,C,1,1)
 
-    # ==================================================
-    # ENERGY LOSS
-    # ==================================================
-    def _energy_loss(self, seg_logits, mask):
-        T = 1.0
-        
-        # Prendiamo solo i logit delle classi ID (0-18) per il calcolo dell'energia
-        id_logits = seg_logits[:, :self.anomaly_class_idx, :, :]
-        energy = -torch.logsumexp(id_logits / T, dim=1)
+        Z = (probs * prior).sum(dim=1)  # (B,H,W)
+        Z = torch.clamp(Z, min=1e-8)
+        Zg = Z ** self.gamma  # emphasize hard ones
 
-        in_mask = (mask != self.anomaly_class_idx) & (mask != self.ignore_index)
-        out_mask = (mask == self.anomaly_class_idx)
+        # Normalize over OOD pixels only (L1)
+        denom = Zg[out_mask].sum().clamp_min(1e-6)
+        Zg_norm = Zg / denom * float(out_mask.sum())  # keep avg weight ~1 on OOD
+        w[out_mask] = Zg_norm[out_mask]
+        return w
 
-        m_in, m_out = -7.0, -5.0
-        loss = torch.tensor(0.0, device=self.device)
+    def energy_loss(self, logits, oe_mask01):
+        """
+        Squared-hinge margins:
+          in:  relu(E - m_in)^2
+          out: relu(m_out - E)^2
+
+        If balanced enabled:
+          - out term weighted by Z_gamma (hardness)
+          - out margin increased: m_out -> m_out + alpha * Z_gamma
+        """
+        E = self.energy_map(logits)  # (B,H,W)
+        in_mask = (oe_mask01 == 0)
+        out_mask = (oe_mask01 == 1)
+
+        loss_in = torch.tensor(0.0, device=self.device)
+        loss_out = torch.tensor(0.0, device=self.device)
 
         if in_mask.any():
-            loss += torch.mean(F.relu(energy[in_mask] - m_in) ** 2)
-        if out_mask.any():
-            loss += torch.mean(F.relu(m_out - energy[out_mask]) ** 2)
+            loss_in = torch.mean(F.relu(E[in_mask] - self.m_in) ** 2)
 
+        if out_mask.any():
+            if self.use_balanced_energy:
+                w_out = self._balanced_weights(logits, oe_mask01)  # (B,H,W)
+                # adaptive margin for hard OOD pixels
+                m_out_adapt = self.m_out + self.alpha * w_out  # (B,H,W)
+                hinge = F.relu(m_out_adapt - E) ** 2
+                # weighted mean over OOD pixels
+                loss_out = (hinge[out_mask] * w_out[out_mask]).mean()
+            else:
+                loss_out = torch.mean(F.relu(self.m_out - E[out_mask]) ** 2)
+
+        loss = loss_in + loss_out
+
+        with torch.no_grad():
+            mean_in = E[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=self.device)
+            mean_out = E[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=self.device)
+            sep = mean_out - mean_in
+
+        return loss, loss_in, loss_out, mean_in, mean_out, sep
+
+    # ----------------------------
+    # Lightning steps
+    # ----------------------------
+    def training_step(self, batch, batch_idx):
+        img, mask, source = batch
+        logits = self(img).float()
+
+        if source == "city":
+            loss_ce = self.ce_loss(logits, mask)
+
+            preds = torch.argmax(logits, dim=1)
+            valid = (mask != self.ignore_index)
+            if valid.any():
+                self.train_miou(preds[valid], mask[valid])
+
+            bs = img.shape[0]
+            self.log("train/loss_ce", loss_ce, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/mIoU", self.train_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+            return loss_ce
+
+        # OE batch (mask is 0/1)
+        else:
+            # Update running OOD prior (only if we have OOD pixels)
+            self._update_ood_prior(logits.detach(), mask)
+
+            loss_e, loss_in, loss_out, mean_in, mean_out, sep = self.energy_loss(logits, mask)
+            loss = self.lambda_energy * loss_e
+
+            bs = img.shape[0]
+            self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/energy_in", mean_in, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/energy_out", mean_out, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/energy_sep", sep, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/hinge_in", loss_in, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/hinge_out", loss_out, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+
+            # Log prior entropy as health-check
+            with torch.no_grad():
+                p = self.ood_prior.clamp_min(1e-8)
+                ent = -(p * p.log()).sum()
+            self.log("train/ood_prior_entropy", ent, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+
+            return loss
+
+    def validation_step(self, batch, batch_idx):
+        img, mask, source = batch
+        if source != "city":
+            return None
+
+        logits = self(img).float()
+        loss = self.ce_loss(logits, mask)
+
+        preds = torch.argmax(logits, dim=1)
+        valid = (mask != self.ignore_index)
+        if valid.any():
+            self.val_miou(preds[valid], mask[valid])
+
+        bs = img.shape[0]
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+        self.log("val/mIoU", self.val_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
         return loss
 
-    # ==================================================
-    # VALIDATION STEP
-    # ==================================================
-    def validation_step(self, batch, batch_idx):
-        img, mask = batch
-        seg_logits = self(img).float()
-
-        # Calcolo Loss (Solo per monitoraggio, uguale al train)
-        mask_ce = mask.clone()
-        mask_ce[mask_ce == self.anomaly_class_idx] = self.ignore_index
-        
-        valid_pixels = (mask_ce != self.ignore_index).sum()
-        if valid_pixels > 0:
-            val_loss = self.ce_loss(seg_logits, mask_ce)
-        else:
-            val_loss = torch.tensor(0.0, device=self.device)
-
-        # Calcolo Metrica
-        preds = torch.argmax(seg_logits, dim=1)
-        
-        # FIX: Anche qui, passiamo tutto alla metrica (classe 19 inclusa)
-        valid_mask = (mask != self.ignore_index)
-        if valid_mask.any():
-            self.val_iou(preds[valid_mask], mask[valid_mask])
-
-        self.log_dict(
-            {
-                "val_loss": val_loss,
-                "val_mIoU": self.val_iou,
-            },
-            prog_bar=True,
-            on_epoch=True,
-        )
-
-        return val_loss
-
-    # ==================================================
-    # OPTIMIZER
-    # ==================================================
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.parameters()),
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt,
-            T_max=100,
-            eta_min=1e-6
-        )
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": sch,
-                "interval": "epoch",
-            },
-        }
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=100, eta_min=1e-6)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "epoch"}}
+
+    @torch.no_grad()
+    def anomaly_score(self, x):
+        logits = self(x).float()
+        E = self.energy_map(logits)
+        return logits, E

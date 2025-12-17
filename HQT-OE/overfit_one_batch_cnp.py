@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # -------------------------------------------------
-# Ensure local imports work in Colab when running via absolute path
+# Ensure local imports work
 # -------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -19,11 +19,19 @@ from models.segmenter import AnomalySegmenter
 # CONFIG
 # -------------------------------------------------
 ZIP_PATH = "/content/drive/MyDrive/Anomaly_Segmentation/cnp_dataset.zip"
+
 BATCH_SIZE = 1
 N_ITERS = 300
-LR = 5e-4
-MIN_ANOM_PIXELS = 2000   # ensure the chosen one-batch actually contains anomaly
+LR = 5e-5          # più vicino al tuo training reale (Lightning lr=5e-5)
 SEED = 0
+
+MIN_ANOM_PIXELS = 2000
+
+# Energy loss hyperparams (come nel tuo modello)
+T = 1.0
+M_IN = -7.0
+M_OUT = -5.0
+W_ENERGY = 1.0     # peso della energy loss (qui è l'unica loss)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
@@ -33,11 +41,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # -------------------------------------------------
-# DATA (pick a batch that actually contains anomalies)
+# DATA: pick one sample with enough anomaly pixels
 # -------------------------------------------------
 ds = CNPZipDataset(ZIP_PATH)
-
-# We search at sample-level (batch_size=1) to guarantee the chosen sample contains anomaly.
 dl = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0)
 
 x = y = None
@@ -45,35 +51,34 @@ for try_i, (xb, yb) in enumerate(dl, start=1):
     anom = int(yb.sum().item())
     if anom >= MIN_ANOM_PIXELS:
         x, y = xb, yb
-        print(f"Selected batch #{try_i} with anomaly_pixels={anom}")
+        print(f"Selected sample #{try_i} with anomaly_pixels={anom}")
         break
-    if try_i >= 200:
-        # fallback: take whatever we got last
+    if try_i >= 300:
         x, y = xb, yb
-        print(f"[WARN] Could not find batch with >= {MIN_ANOM_PIXELS} anomaly pixels in 200 tries. Using anomaly_pixels={anom}")
+        print(f"[WARN] Could not find sample with >= {MIN_ANOM_PIXELS} anomaly pixels in 300 tries. Using anomaly_pixels={anom}")
         break
 
 x = x.to(device)
-y = y.to(device)  # [B,H,W] in {0,1}
+y = y.to(device)  # [1,H,W] in {0,1}
 
+pos = int(y.sum().item())
+tot = int(y.numel())
 print("Batch shapes:", x.shape, y.shape)
-print("Mask unique:", torch.unique(y).tolist())
-pos_per_img = y.view(y.size(0), -1).sum(dim=1)
-print("Anomaly pixels per image:", pos_per_img.tolist())
-print("Anomaly ratio:", float(pos_per_img.item()) / float(y.numel()))
+print("Anomaly pixels:", pos, "ratio:", pos / tot)
 
 # -------------------------------------------------
 # MODEL
 # -------------------------------------------------
-model = AnomalySegmenter()  # LightningModule, but we use it like a plain nn.Module here
+model = AnomalySegmenter()
 model = model.to(device)
 model.train()
 
-ANOMALY_CH = int(getattr(model, "anomaly_class_idx", 19))
-print("Using anomaly channel:", ANOMALY_CH)
+ANOMALY_CLASS_IDX = int(getattr(model, "anomaly_class_idx", 19))
+IGNORE_IDX = int(getattr(model, "ignore_index", 255))
+print("Model anomaly_class_idx:", ANOMALY_CLASS_IDX, "ignore_index:", IGNORE_IDX)
 
 # -------------------------------------------------
-# OPTIM
+# OPTIM (solo parametri trainabili, utile con LoRA)
 # -------------------------------------------------
 opt = torch.optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()),
@@ -82,106 +87,71 @@ opt = torch.optim.AdamW(
 )
 
 # -------------------------------------------------
-# LOSS
+# ENERGY helpers
 # -------------------------------------------------
-EPS = 1e-6
-
-def dice_loss_from_logits(bin_logit, y01):
-    """Soft Dice loss for binary segmentation (helps with sparse positives)."""
-    y01 = y01.float()
-    prob = torch.sigmoid(bin_logit)
-    inter = (prob * y01).sum()
-    denom = prob.sum() + y01.sum()
-    dice = (2.0 * inter + EPS) / (denom + EPS)
-    return 1.0 - dice
-
-def loss_fn(logits, y01, debug=False):
-    """Binary anomaly loss from multi-class logits with class-imbalance handling.
-
-    We build a binary logit as anomaly-vs-non-anomaly log-odds:
-        bin_logit = logit_anom - logsumexp(logits_non_anom)
-
-    Then we use BCEWithLogits with a pos_weight = neg/pos to avoid the trivial
-    solution 'predict all normal'.
+def energy_map_from_logits(seg_logits, anomaly_class_idx=19, T=1.0):
     """
-    if logits.dim() != 4:
-        raise RuntimeError(f"Expected logits [B,C,H,W], got {tuple(logits.shape)}")
+    seg_logits: [B,C,H,W]
+    energy = -logsumexp(logits_ID / T) over ID classes (0..anomaly_class_idx-1)
+    """
+    id_logits = seg_logits[:, :anomaly_class_idx]  # [B,19,H,W] if anomaly=19
+    return -torch.logsumexp(id_logits / T, dim=1)  # [B,H,W]
 
-    C = logits.size(1)
-    if ANOMALY_CH < 0 or ANOMALY_CH >= C:
-        raise RuntimeError(f"ANOMALY_CH={ANOMALY_CH} out of range for C={C}")
+def energy_loss(seg_logits, y01):
+    """
+    y01: [B,H,W] binary mask (1=anomaly, 0=normal)
+    """
+    E = energy_map_from_logits(seg_logits, anomaly_class_idx=ANOMALY_CLASS_IDX, T=T)
 
-    y01 = y01.float()
-    logit_a = logits[:, ANOMALY_CH]  # [B,H,W]
+    in_mask = (y01 == 0)
+    out_mask = (y01 == 1)
 
-    if ANOMALY_CH == C - 1:
-        logits_na = logits[:, :ANOMALY_CH]
-    elif ANOMALY_CH == 0:
-        logits_na = logits[:, 1:]
+    loss = torch.tensor(0.0, device=seg_logits.device)
+
+    if in_mask.any():
+        loss_in = torch.mean(F.relu(E[in_mask] - M_IN) ** 2)
+        loss = loss + loss_in
     else:
-        logits_na = torch.cat([logits[:, :ANOMALY_CH], logits[:, ANOMALY_CH + 1 :]], dim=1)
+        loss_in = torch.tensor(0.0, device=seg_logits.device)
 
-    logit_na = torch.logsumexp(logits_na, dim=1)  # [B,H,W]
-    bin_logit = logit_a - logit_na
+    if out_mask.any():
+        loss_out = torch.mean(F.relu(M_OUT - E[out_mask]) ** 2)
+        loss = loss + loss_out
+    else:
+        loss_out = torch.tensor(0.0, device=seg_logits.device)
 
-    # class imbalance: pos_weight = neg/pos
-    pos = y01.sum()
-    neg = y01.numel() - pos
-    if pos < 1:
-        # No positives -> nothing to learn; return zero but keep graph
-        return (bin_logit * 0.0).sum()
-
-    pos_weight = (neg / pos).clamp(min=1.0, max=1000.0).detach()
-
-    if debug:
-        with torch.no_grad():
-            print(f"[debug] pos={int(pos.item())} neg={int(neg.item())} pos_weight={float(pos_weight.item()):.2f}")
-            print(f"[debug] bin_logit stats: min={float(bin_logit.min()):.3f} max={float(bin_logit.max()):.3f} mean={float(bin_logit.mean()):.3f}")
-
-    bce = F.binary_cross_entropy_with_logits(bin_logit, y01, pos_weight=pos_weight)
-    dsc = dice_loss_from_logits(bin_logit, y01)
-
-    # Weighted sum: BCE stabilizes logits; Dice directly optimizes overlap.
-    return bce + 0.5 * dsc
+    return loss, loss_in, loss_out, E
 
 # -------------------------------------------------
 # OVERFIT LOOP
 # -------------------------------------------------
-print("=== START OVERFIT ===")
+print("=== START ENERGY OVERFIT ===")
 for it in range(1, N_ITERS + 1):
     opt.zero_grad(set_to_none=True)
 
-    logits = model(x)  # [B,C,H,W]
-    loss = loss_fn(logits, y, debug=(it == 1))
-    loss.backward()
+    seg_logits = model(x).float()  # [1,20,H,W]
+    loss, loss_in, loss_out, E = energy_loss(seg_logits, y)
+
+    (W_ENERGY * loss).backward()
     opt.step()
 
     if it % 20 == 0 or it == 1:
         with torch.no_grad():
-            C = logits.size(1)
-            if ANOMALY_CH == C - 1:
-                logits_na = logits[:, :ANOMALY_CH]
-            elif ANOMALY_CH == 0:
-                logits_na = logits[:, 1:]
-            else:
-                logits_na = torch.cat([logits[:, :ANOMALY_CH], logits[:, ANOMALY_CH + 1 :]], dim=1)
+            in_mask = (y == 0)
+            out_mask = (y == 1)
 
-            lg = logits[:, ANOMALY_CH] - torch.logsumexp(logits_na, dim=1)
-            pred = (torch.sigmoid(lg) > 0.5).long()
+            E_in_mean = float(E[in_mask].mean().item()) if in_mask.any() else float("nan")
+            E_out_mean = float(E[out_mask].mean().item()) if out_mask.any() else float("nan")
 
-            if it == 1 or it % 100 == 0:
-                print("[debug] pred_pos_pixels=", int(pred.sum().item()), "gt_pos_pixels=", int(y.sum().item()))
+            # quanto rispetta i margini?
+            in_ok = float((E[in_mask] <= M_IN).float().mean().item()) if in_mask.any() else float("nan")
+            out_ok = float((E[out_mask] >= M_OUT).float().mean().item()) if out_mask.any() else float("nan")
 
-            inter = (pred & y).sum().float()
-            union = (pred | y).sum().float()
-            iou = (inter / (union + 1e-6)).item()
-
-            # Soft IoU (uses probabilities) to see progress even when hard threshold is empty
-            prob = torch.sigmoid(lg)
-            soft_inter = (prob * y.float()).sum().item()
-            soft_union = (prob + y.float() - prob * y.float()).sum().item() + 1e-6
-            soft_iou = soft_inter / soft_union
-
-        print(f"it={it:03d} | loss={loss.item():.4f} | IoU={iou:.3f} | softIoU={soft_iou:.3f} | logits={tuple(logits.shape)}")
+        print(
+            f"it={it:03d} | loss={float(loss.item()):.4f} "
+            f"(in={float(loss_in.item()):.4f}, out={float(loss_out.item()):.4f}) | "
+            f"E_in_mean={E_in_mean:.3f} E_out_mean={E_out_mean:.3f} | "
+            f"in_ok={in_ok:.3f} out_ok={out_ok:.3f}"
+        )
 
 print("=== DONE ===")

@@ -1,145 +1,275 @@
+# train.py
 import os
+import argparse
+from pathlib import Path
+import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, IterableDataset
+
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint
-from torch.utils.data import DataLoader
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-# Importa i tuoi moduli custom
-from datasets.hybrid_anomaly import HybridAnomalyDataset
-from datasets.road_anomaly import RoadAnomalyDataset
-from models.segmenter import AnomalySegmenter 
+from models.segmenter import AnomalySegmenter
 
-# --- CONFIGURAZIONE PERCORSI (DATI LOCALI) ---
-PATH_CITY = "/content/Cityscapes_Local"
-PATH_COCO = "/content/COCO_Local"
-PATH_ROAD_ANOMALY = "/content/drive/MyDrive/Anomaly_Segmentation/RoadAnomaly"
-CHECKPOINT_DIR = "/content/drive/MyDrive/AnomalyProject/checkpoints"
-LOG_DIR = "/content/drive/MyDrive/AnomalyProject/logs"
+# IMPORTA I TUOI DATASET REALI:
+# - Cityscapes dataset -> (img, trainIdsMask, "city")
+# - CutPaste/OE dataset -> (img, oeMask01, "cnp")
+#
+# Esempio: dal tuo progetto
+from cnp_zip_dataset import CNPZipDataset
+# Se hai il tuo CityscapesZipLabelIdsToTrainIds, importa quello.
+from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper  # <- se li hai già
 
-# --- IPERPARAMETRI OTTIMIZZATI ---
-# Con i dati in locale e FP16, possiamo spingere di più:
-BATCH_SIZE = 2        # Aumentato da 2 a 4 (Prova 4, se va OOM torna a 2)
-NUM_WORKERS = 2       # Aumentato da 2 a 4 (Sfrutta tutta la CPU di Colab)
-ACCUMULATE_GRAD = 1   # Ridotto a 1 perché il batch reale è già 4
-IMG_SIZE = (518, 518)
-MAX_EPOCHS = 6
-LR = 5e-5             
 
-# --- DEFINIZIONE CLASSI ---
-NUM_CLASSES = 20      
-ANOMALY_IDX = 19      
-IGNORE_IDX = 255      
+def cycle(dl):
+    while True:
+        for b in dl:
+            yield b
+
+
+class MixedFiniteIterable(IterableDataset):
+    """
+    Mixa batches interi: pattern = city*mix_city + cnp*mix_cnp
+    steps_per_epoch = numero batch totali (indipendente da lunghezza dataset)
+    """
+    def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
+        super().__init__()
+        self.city = cycle(dl_city) if dl_city is not None else None
+        self.cnp = cycle(dl_cnp)
+        self.pattern = (["city"] * int(mix_city)) + (["cnp"] * int(mix_cnp))
+        self.steps_per_epoch = int(steps_per_epoch)
+
+    def __iter__(self):
+        n = 0
+        while n < self.steps_per_epoch:
+            for p in self.pattern:
+                if n >= self.steps_per_epoch:
+                    break
+                if p == "city":
+                    yield next(self.city) if self.city is not None else next(self.cnp)
+                else:
+                    yield next(self.cnp)
+                n += 1
+
+
+class DebugCallback(L.Callback):
+    """
+    Stampa debug leggibile ogni N step e sui primi batch per verificare che “impara”.
+    """
+    def __init__(self, every_n_steps=20):
+        self.every_n_steps = every_n_steps
+        self.seen_city = 0
+        self.seen_cnp = 0
+
+    @staticmethod
+    def _stats_mask_city(mask, ignore_index=255):
+        valid = (mask != ignore_index)
+        valid_pct = float(valid.float().mean().item() * 100.0)
+        uniq = torch.unique(mask[valid]).detach().cpu().tolist() if valid.any() else []
+        return valid_pct, uniq[:25]
+
+    @staticmethod
+    def _stats_mask_cnp(mask01):
+        uniq = torch.unique(mask01).detach().cpu().tolist()
+        anom_pct = float((mask01 == 1).float().mean().item() * 100.0)
+        return anom_pct, uniq
+
+    @staticmethod
+    def _energy_stats(module, img):
+        logits = module(img).float()
+        E = module.energy_map(logits)
+        return {
+            "logits_min": float(logits.min().item()),
+            "logits_max": float(logits.max().item()),
+            "E_mean": float(E.mean().item()),
+            "E_min": float(E.min().item()),
+            "E_max": float(E.max().item()),
+        }
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        img, mask, source = batch
+
+        # primi batch: stampa forma e mask stats
+        if source == "city" and self.seen_city < 2:
+            self.seen_city += 1
+            vp, uq = self._stats_mask_city(mask, ignore_index=pl_module.ignore_index)
+            print(f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
+                  f"valid%={vp:.1f} uniq={uq}")
+
+        if source != "city" and self.seen_cnp < 2:
+            self.seen_cnp += 1
+            ap, uq = self._stats_mask_cnp(mask)
+            print(f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
+                  f"anom%={ap:.2f} uniq={uq}")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_step == 0:
+            return
+
+        if trainer.global_step % self.every_n_steps == 0:
+            metrics = trainer.callback_metrics
+            # alcuni valori potrebbero non esserci sempre
+            tl_ce = metrics.get("train/loss_ce")
+            tl_en = metrics.get("train/loss_energy")
+            miou = metrics.get("train/mIoU")
+            vmiou = metrics.get("val/mIoU")
+
+            # energy separation utile se stai facendo OE
+            e_sep = metrics.get("train/energy_sep")
+            e_in = metrics.get("train/energy_in")
+            e_out = metrics.get("train/energy_out")
+
+            def fmt(x):
+                if x is None:
+                    return "NA"
+                try:
+                    return f"{float(x):.4f}"
+                except Exception:
+                    return "NA"
+
+            print(
+                f"[DBG step={trainer.global_step}] "
+                f"loss_ce={fmt(tl_ce)} loss_energy={fmt(tl_en)} "
+                f"train_mIoU={fmt(miou)} val_mIoU={fmt(vmiou)} "
+                f"E_sep={fmt(e_sep)} E_in={fmt(e_in)} E_out={fmt(e_out)}"
+            )
+
+        # warning gentile: OE batch senza anomalie (non è crash)
+        img, mask, source = batch
+        if source != "city":
+            uniq = torch.unique(mask).detach().cpu().tolist()
+            if uniq == [0]:
+                print(f"[WARN] OE batch step={trainer.global_step} uniq=[0] (no anomalies). "
+                      f"Non è un errore: succede se il cut&paste a volte genera mask vuote.")
+
 
 def main():
-    print(f"--- Avvio Training (Fast Mode) ---")
-    print(f"Hardware: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cnp_zip", type=str, required=True)
+    ap.add_argument("--city_root", type=str, required=True)
+    ap.add_argument("--img_h", type=int, default=518)
+    ap.add_argument("--img_w", type=int, default=518)
 
-    # --- A. DATASETS ---
-    print("--> Caricamento Training Set (Hybrid)...")
-    # Controllo di sicurezza: se hai dimenticato di lanciare la cella di setup
-    if not os.path.exists(PATH_CITY) or not os.path.exists(PATH_COCO):
-        raise FileNotFoundError(f"❌ ERRORE: Non trovo i dati in {PATH_CITY} o {PATH_COCO}. Hai lanciato la cella di 'SETUP CORRETTO (Zip Mode)'?")
+    ap.add_argument("--batch_city", type=int, default=2)
+    ap.add_argument("--batch_cnp", type=int, default=1)
+    ap.add_argument("--mix_city", type=int, default=3)
+    ap.add_argument("--mix_cnp", type=int, default=1)
 
-    train_ds = HybridAnomalyDataset(
-        cityscapes_root=PATH_CITY,
-        coco_root=PATH_COCO,
-        img_size=IMG_SIZE
+    ap.add_argument("--steps_per_epoch", type=int, default=200)
+    ap.add_argument("--max_epochs", type=int, default=3)
+
+    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--num_workers", type=int, default=0)
+
+    ap.add_argument("--ckpt_dir", type=str, default="./checkpoints")
+    ap.add_argument("--log_dir", type=str, default="./logs")
+    ap.add_argument("--seed", type=int, default=0)
+
+    # energy settings (coerenti col paper)
+    ap.add_argument("--T", type=float, default=1.0)
+    ap.add_argument("--m_in", type=float, default=-12.0)
+    ap.add_argument("--m_out", type=float, default=-6.0)
+    ap.add_argument("--lambda_energy", type=float, default=0.1)
+    ap.add_argument("--gamma", type=float, default=3.0)
+    ap.add_argument("--alpha", type=float, default=5.0)
+
+    args = ap.parse_args()
+
+    L.seed_everything(args.seed, workers=True)
+    img_size = (args.img_h, args.img_w)
+
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    # ----------------------------
+    # Datasets / loaders
+    # ----------------------------
+    # OE dataset (tu l'hai già pronto: qui uso CNPZipDataset + wrapper resize)
+    cnp_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip), img_size=img_size)
+    dl_cnp = DataLoader(
+        cnp_ds,
+        batch_size=args.batch_cnp,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
     )
-    
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=NUM_WORKERS, # <--- 4 Workers per massima velocità
-        persistent_workers=True, # Mantiene i workers vivi tra le epoche
-        pin_memory=True
+
+    # Cityscapes (train + val)
+    city_ds = CityscapesZipLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
+    dl_city = DataLoader(
+        city_ds,
+        batch_size=args.batch_city,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
     )
 
-    print("--> Verifica Validation Set (RoadAnomaly)...")
-    val_loader = None
-    use_validation = False
-    
-    if os.path.exists(PATH_ROAD_ANOMALY):
-        try:
-            val_ds = RoadAnomalyDataset(
-                root_path=PATH_ROAD_ANOMALY,
-                img_size=IMG_SIZE
-            )
-            if len(val_ds) > 0:
-                # Anche qui aumentiamo workers e batch size
-                val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-                use_validation = True
-                print(f"Validation Set caricato: {len(val_ds)} immagini.")
-            else:
-                print("Cartella RoadAnomaly vuota.")
-        except Exception as e:
-            print(f"Errore caricamento RoadAnomaly: {e}.")
-    else:
-        print(f"Dataset Validazione NON trovato in: {PATH_ROAD_ANOMALY}")
+    val_ds = CityscapesZipLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
+    dl_val = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    # --- B. MODELLO ---
-    print("--> Inizializzazione Modello (ViT-Large + LoRA)...")
+    mixed_iter = MixedFiniteIterable(
+        dl_city=dl_city,
+        dl_cnp=dl_cnp,
+        mix_city=args.mix_city,
+        mix_cnp=args.mix_cnp,
+        steps_per_epoch=args.steps_per_epoch,
+    )
+    dl_train = DataLoader(mixed_iter, batch_size=None, num_workers=0)
+
+    # ----------------------------
+    # Model
+    # ----------------------------
     model = AnomalySegmenter(
-        img_size=IMG_SIZE,
-        num_classes=NUM_CLASSES,       
-        anomaly_class_idx=ANOMALY_IDX, 
-        ignore_index=IGNORE_IDX,       
-        lr=LR,
-        backbone_name="vit_large_patch14_reg4_dinov2"
+        img_size=img_size,
+        lr=args.lr,
+        T=args.T,
+        m_in=args.m_in,
+        m_out=args.m_out,
+        lambda_energy=args.lambda_energy,
+        gamma=args.gamma,
+        alpha=args.alpha,
+        use_balanced_energy=True,
     )
 
-    # --- C. CALLBACKS ---
-    monitor_metric = "val_loss" if use_validation else "train_loss"
-    print(f"--> Monitoraggio checkpoint su: {monitor_metric}")
-
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=CHECKPOINT_DIR,
-        filename="anomaly-fast-{epoch:02d}-{" + monitor_metric + ":.2f}",
-        save_top_k=1,            
-        monitor=monitor_metric,
-        mode="min",
-        save_last=True           
+    # ----------------------------
+    # Callbacks
+    # ----------------------------
+    ckpt = ModelCheckpoint(
+        dirpath=args.ckpt_dir,
+        filename="seg-{epoch:02d}-{step:06d}-{val_mIoU:.4f}",
+        save_last=True,
+        save_top_k=2,
+        monitor="val/mIoU",
+        mode="max",
     )
+    lrmon = LearningRateMonitor(logging_interval="step")
+    dbg = DebugCallback(every_n_steps=20)
 
-    # --- D. TRAINER ---
     trainer = L.Trainer(
-        max_epochs=MAX_EPOCHS,
-        accelerator="gpu",
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        
-        # OTTIMIZZAZIONI VELOCITÀ
-        precision="16-mixed",     # <--- Torniamo a FP16 (Veloce e leggero)
-        accumulate_grad_batches=ACCUMULATE_GRAD,
-        
-        callbacks=[checkpoint_callback],
+        precision="16-mixed" if torch.cuda.is_available() else "32-true",
+        max_epochs=args.max_epochs,
+        callbacks=[ckpt, lrmon, dbg],
+        default_root_dir=args.log_dir,
         log_every_n_steps=10,
-        default_root_dir=LOG_DIR,
-        check_val_every_n_epoch=1 if use_validation else 0, 
-        limit_val_batches=1.0 if use_validation else 0,     
-
-        # SICUREZZA
         gradient_clip_val=0.5,
-        gradient_clip_algorithm="norm"
+        gradient_clip_algorithm="norm",
+        check_val_every_n_epoch=1,
+        num_sanity_val_steps=2,
     )
 
-    # --- E. START / RESUME ---
-    ckpt_path = os.path.join(CHECKPOINT_DIR, "last.ckpt")
-    
-    if os.path.exists(ckpt_path):
-        print(f"🔄 TROVATO CHECKPOINT! Riprendo da: {ckpt_path}")
-        try:
-            trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
-        except Exception as e:
-            print(f"⚠️ Checkpoint corrotto o incompatibile: {e}")
-            print("Restarting from scratch...")
-            trainer.fit(model, train_loader, val_loader)
-    else:
-        print("🆕 Training da zero.")
-        trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val)
 
-    print("🎉 Training Concluso!")
 
 if __name__ == "__main__":
-    # Ottimizzazione extra per le operazioni di matrice su Tesla T4
-    torch.set_float32_matmul_precision('medium')
     main()

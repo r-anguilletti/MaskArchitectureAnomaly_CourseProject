@@ -216,7 +216,7 @@ class Dataset(torch.utils.data.Dataset):
         if self.transforms is not None:
             img, target = self.transforms(img, target)
 
-        return img, target
+        return img, target, "city"
 
     def _load_zips(
         self,
