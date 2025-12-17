@@ -49,4 +49,4 @@ class CNPZipDataset(Dataset):
         ).long()
         m_t = (m_t > 127).long()
 
-        return img_t, m_t, "cnp"
+        return img_t, m_t, 1

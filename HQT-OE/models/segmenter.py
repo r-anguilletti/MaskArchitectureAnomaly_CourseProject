@@ -17,9 +17,9 @@ class AnomalySegmenter(L.LightningModule):
       - OE cut&paste: Energy-based separation
       - Balanced Energy Regularization (CVPR'23 style): focuses harder OOD pixels
 
-    Outputs:
-      - forward(x) -> ID logits (B,C,H,W)
-      - anomaly_score(x) -> energy map (B,H,W)
+    Convention:
+      source == 0  -> Cityscapes (ID)
+      source == 1  -> CNP/OE (OOD mask 0/1)
     """
 
     def __init__(
@@ -37,9 +37,9 @@ class AnomalySegmenter(L.LightningModule):
         lambda_energy=0.1,
         # Balanced energy (paper-inspired)
         use_balanced_energy=True,
-        gamma=3.0,     # controls "peakedness" of Z_gamma
-        alpha=5.0,     # margin amplification for hard OOD
-        prior_momentum=0.99,  # EMA update for p(y|o)
+        gamma=3.0,
+        alpha=5.0,
+        prior_momentum=0.99,
         # LoRA
         lora_r=8,
         lora_alpha=16,
@@ -101,10 +101,36 @@ class AnomalySegmenter(L.LightningModule):
             average="macro"
         )
 
-        # Running estimate of p(y|o) for balanced energy (1D vector, size C)
-        # Start uniform to avoid weird early bias.
+        # Running estimate of p(y|o)
         prior = torch.ones(num_id_classes, dtype=torch.float32) / float(num_id_classes)
         self.register_buffer("ood_prior", prior)
+
+    # ----------------------------
+    # Utility: normalize source
+    # ----------------------------
+    @staticmethod
+    def _source_to_int(source):
+        """
+        Handles: int, tensor([B]), list/tuple of len B, single string, etc.
+        Returns a python int.
+        """
+        if torch.is_tensor(source):
+            # e.g. tensor([0,0]) or tensor(0)
+            if source.ndim == 0:
+                return int(source.item())
+            return int(source[0].item())
+
+        if isinstance(source, (list, tuple)):
+            # e.g. ["city","city"] or [0,0]
+            if len(source) == 0:
+                raise ValueError("Empty source list/tuple in batch.")
+            return AnomalySegmenter._source_to_int(source[0])
+
+        if isinstance(source, str):
+            # support legacy
+            return 0 if source == "city" else 1
+
+        return int(source)
 
     # ----------------------------
     # LoRA
@@ -160,21 +186,15 @@ class AnomalySegmenter(L.LightningModule):
     # Energy
     # ----------------------------
     def energy_map(self, logits):
-        # E = -T logsumexp(logits/T)
         return -self.T * torch.logsumexp(logits / self.T, dim=1)
 
     @torch.no_grad()
     def _update_ood_prior(self, logits, oe_mask01):
-        """
-        Update EMA estimate of p(y|o) using OOD pixels only.
-        """
         out_mask = (oe_mask01 == 1)
         if not out_mask.any():
             return
 
-        # probs over ID classes
         probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
-        # mean distribution across OOD pixels
         p = probs.permute(0, 2, 3, 1)[out_mask].mean(dim=0)  # (C,)
         if torch.isnan(p).any():
             return
@@ -182,47 +202,28 @@ class AnomalySegmenter(L.LightningModule):
         m = self.prior_momentum
         self.ood_prior.mul_(m).add_((1.0 - m) * p)
 
-        # keep normalized
         s = self.ood_prior.sum().clamp_min(1e-6)
         self.ood_prior.div_(s)
 
     def _balanced_weights(self, logits, oe_mask01):
-        """
-        Paper-inspired "hardness" weight for OOD pixels:
-          Z(x) = sum_j p(y=j|x) * p(y=j|o)
-          Z_gamma = normalize( Z(x)^gamma )
-        Returns:
-          w_out: (B,H,W) weights (only meaningful on OOD pixels, else 0)
-        """
         out_mask = (oe_mask01 == 1)
         B, C, H, W = logits.shape
         w = torch.zeros((B, H, W), device=logits.device, dtype=logits.dtype)
         if not out_mask.any():
             return w
 
-        probs = torch.softmax(logits, dim=1)  # (B,C,H,W)
-        prior = self.ood_prior.view(1, C, 1, 1).to(probs.dtype)  # (1,C,1,1)
+        probs = torch.softmax(logits, dim=1)
+        prior = self.ood_prior.view(1, C, 1, 1).to(probs.dtype)
 
-        Z = (probs * prior).sum(dim=1)  # (B,H,W)
-        Z = torch.clamp(Z, min=1e-8)
-        Zg = Z ** self.gamma  # emphasize hard ones
+        Z = (probs * prior).sum(dim=1).clamp_min(1e-8)
+        Zg = Z ** self.gamma
 
-        # Normalize over OOD pixels only (L1)
         denom = Zg[out_mask].sum().clamp_min(1e-6)
-        Zg_norm = Zg / denom * float(out_mask.sum())  # keep avg weight ~1 on OOD
+        Zg_norm = Zg / denom * float(out_mask.sum())  # avg ~1 on OOD pixels
         w[out_mask] = Zg_norm[out_mask]
         return w
 
     def energy_loss(self, logits, oe_mask01):
-        """
-        Squared-hinge margins:
-          in:  relu(E - m_in)^2
-          out: relu(m_out - E)^2
-
-        If balanced enabled:
-          - out term weighted by Z_gamma (hardness)
-          - out margin increased: m_out -> m_out + alpha * Z_gamma
-        """
         E = self.energy_map(logits)  # (B,H,W)
         in_mask = (oe_mask01 == 0)
         out_mask = (oe_mask01 == 1)
@@ -235,11 +236,9 @@ class AnomalySegmenter(L.LightningModule):
 
         if out_mask.any():
             if self.use_balanced_energy:
-                w_out = self._balanced_weights(logits, oe_mask01)  # (B,H,W)
-                # adaptive margin for hard OOD pixels
-                m_out_adapt = self.m_out + self.alpha * w_out  # (B,H,W)
+                w_out = self._balanced_weights(logits, oe_mask01)
+                m_out_adapt = self.m_out + self.alpha * w_out
                 hinge = F.relu(m_out_adapt - E) ** 2
-                # weighted mean over OOD pixels
                 loss_out = (hinge[out_mask] * w_out[out_mask]).mean()
             else:
                 loss_out = torch.mean(F.relu(self.m_out - E[out_mask]) ** 2)
@@ -258,9 +257,11 @@ class AnomalySegmenter(L.LightningModule):
     # ----------------------------
     def training_step(self, batch, batch_idx):
         img, mask, source = batch
+        source = self._source_to_int(source)
+
         logits = self(img).float()
 
-        if source == "city":
+        if source == 0:  # City
             loss_ce = self.ce_loss(logits, mask)
 
             preds = torch.argmax(logits, dim=1)
@@ -273,9 +274,7 @@ class AnomalySegmenter(L.LightningModule):
             self.log("train/mIoU", self.train_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
             return loss_ce
 
-        # OE batch (mask is 0/1)
-        else:
-            # Update running OOD prior (only if we have OOD pixels)
+        else:  # CNP/OE (mask is 0/1)
             self._update_ood_prior(logits.detach(), mask)
 
             loss_e, loss_in, loss_out, mean_in, mean_out, sep = self.energy_loss(logits, mask)
@@ -289,7 +288,6 @@ class AnomalySegmenter(L.LightningModule):
             self.log("train/hinge_in", loss_in, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/hinge_out", loss_out, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
 
-            # Log prior entropy as health-check
             with torch.no_grad():
                 p = self.ood_prior.clamp_min(1e-8)
                 ent = -(p * p.log()).sum()
@@ -299,7 +297,9 @@ class AnomalySegmenter(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         img, mask, source = batch
-        if source != "city":
+        source = self._source_to_int(source)
+
+        if source != 0:
             return None
 
         logits = self(img).float()

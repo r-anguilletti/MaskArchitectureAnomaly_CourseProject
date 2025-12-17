@@ -91,7 +91,7 @@ class CityscapesZipLabelIdsToTrainIds(Dataset):
         m = self.mask_tf(m)
         mask_t = labelids_to_trainids(m)
 
-        return img_t, mask_t, "city"
+        return img_t, mask_t, 0
 
 
 # ---------------------------

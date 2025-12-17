@@ -1,25 +1,15 @@
 # train.py
 import os
 import argparse
-from pathlib import Path
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, IterableDataset
-
+from torch.utils.data import DataLoader, IterableDataset
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from models.segmenter import AnomalySegmenter
 
-# IMPORTA I TUOI DATASET REALI:
-# - Cityscapes dataset -> (img, trainIdsMask, "city")
-# - CutPaste/OE dataset -> (img, oeMask01, "cnp")
-#
-# Esempio: dal tuo progetto
 from cnp_zip_dataset import CNPZipDataset
-# Se hai il tuo CityscapesZipLabelIdsToTrainIds, importa quello.
-from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper  # <- se li hai già
+from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper
 
 
 def cycle(dl):
@@ -31,13 +21,13 @@ def cycle(dl):
 class MixedFiniteIterable(IterableDataset):
     """
     Mixa batches interi: pattern = city*mix_city + cnp*mix_cnp
-    steps_per_epoch = numero batch totali (indipendente da lunghezza dataset)
+    steps_per_epoch = numero batch totali
     """
     def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
         super().__init__()
         self.city = cycle(dl_city) if dl_city is not None else None
         self.cnp = cycle(dl_cnp)
-        self.pattern = (["city"] * int(mix_city)) + (["cnp"] * int(mix_cnp))
+        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # 0=city, 1=cnp
         self.steps_per_epoch = int(steps_per_epoch)
 
     def __iter__(self):
@@ -46,7 +36,7 @@ class MixedFiniteIterable(IterableDataset):
             for p in self.pattern:
                 if n >= self.steps_per_epoch:
                     break
-                if p == "city":
+                if p == 0:
                     yield next(self.city) if self.city is not None else next(self.cnp)
                 else:
                     yield next(self.cnp)
@@ -54,13 +44,22 @@ class MixedFiniteIterable(IterableDataset):
 
 
 class DebugCallback(L.Callback):
-    """
-    Stampa debug leggibile ogni N step e sui primi batch per verificare che “impara”.
-    """
     def __init__(self, every_n_steps=20):
         self.every_n_steps = every_n_steps
         self.seen_city = 0
         self.seen_cnp = 0
+
+    @staticmethod
+    def _source_to_int(source):
+        if torch.is_tensor(source):
+            if source.ndim == 0:
+                return int(source.item())
+            return int(source[0].item())
+        if isinstance(source, (list, tuple)):
+            return DebugCallback._source_to_int(source[0])
+        if isinstance(source, str):
+            return 0 if source == "city" else 1
+        return int(source)
 
     @staticmethod
     def _stats_mask_city(mask, ignore_index=255):
@@ -75,29 +74,17 @@ class DebugCallback(L.Callback):
         anom_pct = float((mask01 == 1).float().mean().item() * 100.0)
         return anom_pct, uniq
 
-    @staticmethod
-    def _energy_stats(module, img):
-        logits = module(img).float()
-        E = module.energy_map(logits)
-        return {
-            "logits_min": float(logits.min().item()),
-            "logits_max": float(logits.max().item()),
-            "E_mean": float(E.mean().item()),
-            "E_min": float(E.min().item()),
-            "E_max": float(E.max().item()),
-        }
-
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         img, mask, source = batch
+        s = self._source_to_int(source)
 
-        # primi batch: stampa forma e mask stats
-        if source == "city" and self.seen_city < 2:
+        if s == 0 and self.seen_city < 2:
             self.seen_city += 1
             vp, uq = self._stats_mask_city(mask, ignore_index=pl_module.ignore_index)
             print(f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
                   f"valid%={vp:.1f} uniq={uq}")
 
-        if source != "city" and self.seen_cnp < 2:
+        if s == 1 and self.seen_cnp < 2:
             self.seen_cnp += 1
             ap, uq = self._stats_mask_cnp(mask)
             print(f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
@@ -109,13 +96,10 @@ class DebugCallback(L.Callback):
 
         if trainer.global_step % self.every_n_steps == 0:
             metrics = trainer.callback_metrics
-            # alcuni valori potrebbero non esserci sempre
             tl_ce = metrics.get("train/loss_ce")
             tl_en = metrics.get("train/loss_energy")
             miou = metrics.get("train/mIoU")
             vmiou = metrics.get("val/mIoU")
-
-            # energy separation utile se stai facendo OE
             e_sep = metrics.get("train/energy_sep")
             e_in = metrics.get("train/energy_in")
             e_out = metrics.get("train/energy_out")
@@ -135,9 +119,9 @@ class DebugCallback(L.Callback):
                 f"E_sep={fmt(e_sep)} E_in={fmt(e_in)} E_out={fmt(e_out)}"
             )
 
-        # warning gentile: OE batch senza anomalie (non è crash)
         img, mask, source = batch
-        if source != "city":
+        s = self._source_to_int(source)
+        if s == 1:
             uniq = torch.unique(mask).detach().cpu().tolist()
             if uniq == [0]:
                 print(f"[WARN] OE batch step={trainer.global_step} uniq=[0] (no anomalies). "
@@ -166,7 +150,6 @@ def main():
     ap.add_argument("--log_dir", type=str, default="./logs")
     ap.add_argument("--seed", type=int, default=0)
 
-    # energy settings (coerenti col paper)
     ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--m_in", type=float, default=-12.0)
     ap.add_argument("--m_out", type=float, default=-6.0)
@@ -185,7 +168,10 @@ def main():
     # ----------------------------
     # Datasets / loaders
     # ----------------------------
-    # OE dataset (tu l'hai già pronto: qui uso CNPZipDataset + wrapper resize)
+    # IMPORTANT: datasets should return:
+    #   City: (img, trainIdsMask, 0)
+    #   CNP : (img, oeMask01,     1)
+
     cnp_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip), img_size=img_size)
     dl_cnp = DataLoader(
         cnp_ds,
@@ -196,7 +182,6 @@ def main():
         drop_last=True,
     )
 
-    # Cityscapes (train + val)
     city_ds = CityscapesZipLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
     dl_city = DataLoader(
         city_ds,
