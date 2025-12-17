@@ -19,15 +19,11 @@ def cycle(dl):
 
 
 class MixedFiniteIterable(IterableDataset):
-    """
-    Mixa batches interi: pattern = city*mix_city + cnp*mix_cnp
-    steps_per_epoch = numero batch totali
-    """
     def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
         super().__init__()
         self.city = cycle(dl_city) if dl_city is not None else None
         self.cnp = cycle(dl_cnp)
-        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # 0=city, 1=cnp
+        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # ✅ 0=city, 1=cnp
         self.steps_per_epoch = int(steps_per_epoch)
 
     def __iter__(self):
@@ -50,18 +46,6 @@ class DebugCallback(L.Callback):
         self.seen_cnp = 0
 
     @staticmethod
-    def _source_to_int(source):
-        if torch.is_tensor(source):
-            if source.ndim == 0:
-                return int(source.item())
-            return int(source[0].item())
-        if isinstance(source, (list, tuple)):
-            return DebugCallback._source_to_int(source[0])
-        if isinstance(source, str):
-            return 0 if source == "city" else 1
-        return int(source)
-
-    @staticmethod
     def _stats_mask_city(mask, ignore_index=255):
         valid = (mask != ignore_index)
         valid_pct = float(valid.float().mean().item() * 100.0)
@@ -76,19 +60,25 @@ class DebugCallback(L.Callback):
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         img, mask, source = batch
-        s = self._source_to_int(source)
 
-        if s == 0 and self.seen_city < 2:
+        # source può essere int o tensor batchato -> portiamolo a int
+        if torch.is_tensor(source):
+            # caso tipico: tensor([0,0]) o tensor([1]) -> prendiamo il primo
+            source_i = int(source.flatten()[0].item())
+        else:
+            source_i = int(source)
+
+        if source_i == 0 and self.seen_city < 2:
             self.seen_city += 1
             vp, uq = self._stats_mask_city(mask, ignore_index=pl_module.ignore_index)
             print(f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                  f"valid%={vp:.1f} uniq={uq}")
+                f"valid%={vp:.1f} uniq={uq}")
 
-        if s == 1 and self.seen_cnp < 2:
+        if source_i == 1 and self.seen_cnp < 2:
             self.seen_cnp += 1
             ap, uq = self._stats_mask_cnp(mask)
             print(f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                  f"anom%={ap:.2f} uniq={uq}")
+                f"anom%={ap:.2f} uniq={uq}")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if trainer.global_step == 0:
@@ -120,12 +110,12 @@ class DebugCallback(L.Callback):
             )
 
         img, mask, source = batch
-        s = self._source_to_int(source)
-        if s == 1:
+        source_i = int(source.flatten()[0].item()) if torch.is_tensor(source) else int(source)
+
+        if source_i == 1:
             uniq = torch.unique(mask).detach().cpu().tolist()
             if uniq == [0]:
-                print(f"[WARN] OE batch step={trainer.global_step} uniq=[0] (no anomalies). "
-                      f"Non è un errore: succede se il cut&paste a volte genera mask vuote.")
+                print(f"[WARN] OE batch step={trainer.global_step} uniq=[0] (no anomalies). ...")
 
 
 def main():
@@ -230,7 +220,7 @@ def main():
     # ----------------------------
     ckpt = ModelCheckpoint(
         dirpath=args.ckpt_dir,
-        filename="seg-{epoch:02d}-{step:06d}-{val_mIoU:.4f}",
+        filename="seg-{epoch:02d}-{step:06d}",
         save_last=True,
         save_top_k=2,
         monitor="val/mIoU",

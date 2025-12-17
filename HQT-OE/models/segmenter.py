@@ -109,27 +109,9 @@ class AnomalySegmenter(L.LightningModule):
     # Utility: normalize source
     # ----------------------------
     @staticmethod
-    def _source_to_int(source):
-        """
-        Handles: int, tensor([B]), list/tuple of len B, single string, etc.
-        Returns a python int.
-        """
+    def _source_to_int(self, source):
         if torch.is_tensor(source):
-            # e.g. tensor([0,0]) or tensor(0)
-            if source.ndim == 0:
-                return int(source.item())
-            return int(source[0].item())
-
-        if isinstance(source, (list, tuple)):
-            # e.g. ["city","city"] or [0,0]
-            if len(source) == 0:
-                raise ValueError("Empty source list/tuple in batch.")
-            return AnomalySegmenter._source_to_int(source[0])
-
-        if isinstance(source, str):
-            # support legacy
-            return 0 if source == "city" else 1
-
+            return int(source.flatten()[0].item())
         return int(source)
 
     # ----------------------------
@@ -257,7 +239,7 @@ class AnomalySegmenter(L.LightningModule):
     # ----------------------------
     def training_step(self, batch, batch_idx):
         img, mask, source = batch
-        source = self._source_to_int(source)
+        source = self._source_to_int(self, source)
 
         logits = self(img).float()
 
@@ -297,7 +279,7 @@ class AnomalySegmenter(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         img, mask, source = batch
-        source = self._source_to_int(source)
+        source = self._source_to_int(self, source)
 
         if source != 0:
             return None
