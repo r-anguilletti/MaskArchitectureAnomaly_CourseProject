@@ -15,7 +15,7 @@ PATH_CITY = "/content/Cityscapes_Local"
 PATH_COCO = "/content/COCO_Local"
 
 IMG_SIZE = (518, 518)          # come nel tuo check_data.py
-N_SAMPLES = 20000              # quanti campioni vuoi pre-generare
+N_SAMPLES = 10000              # quanti campioni vuoi pre-generare
 ANOMALY_CLASS_ID = 19          # come nel tuo progetto (hybrid_anomaly.py)
 
 TMP_OUT = Path("/content/tmp_cnp_from_hybrid")
