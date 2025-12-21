@@ -93,6 +93,73 @@ class CityscapesZipLabelIdsToTrainIds(Dataset):
 
         return img_t, mask_t, 0
 
+class CityscapesFolderLabelIdsToTrainIds(Dataset):
+    """
+    Cityscapes da filesystem (cartelle).
+    Si aspetta una struttura tipo:
+
+    root/
+      leftImg8bit/
+        train/val/test/
+          frankfurt/...
+      gtFine/
+        train/val/test/
+          frankfurt/...
+
+    Ritorna: (img_t, mask_trainIds, "city")
+    dove mask_trainIds è in {0..18} e 255=ignore
+    """
+    def __init__(self, root: str, split: str = "train", img_size=(518, 518)):
+        self.root = Path(root)
+        self.split = split
+        self.img_size = img_size
+
+        self.left_dir = self.root / "leftImg8bit" / split
+        self.gt_dir   = self.root / "gtFine" / split
+
+        assert self.left_dir.exists(), f"Non trovo {self.left_dir}"
+        assert self.gt_dir.exists(),   f"Non trovo {self.gt_dir}"
+
+        # lista immagini
+        self.img_names = sorted(self.left_dir.rglob("*_leftImg8bit.png"))
+        assert len(self.img_names) > 0, f"Nessuna immagine trovata in {self.left_dir}"
+
+        # lista maschere corrispondenti
+        self.mask_names = []
+        for p in self.img_names:
+            city = p.parent.name
+            base = p.name.replace("_leftImg8bit.png", "")
+            m = self.gt_dir / city / f"{base}_gtFine_labelIds.png"
+            self.mask_names.append(m)
+
+        # sanity: verifica corrispondenza (se manca qualcosa, esplode subito)
+        missing = [str(m) for m in self.mask_names if not m.exists()]
+        if len(missing) > 0:
+            raise FileNotFoundError(
+                f"Mancano {len(missing)} maschere gtFine. Esempi:\n" + "\n".join(missing[:10])
+            )
+
+        self.img_tf = transforms.Compose([
+            transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+        ])
+        self.mask_tf = transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.NEAREST)
+
+    def __len__(self):
+        return len(self.img_names)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.img_names[idx]).convert("RGB")
+        img.load()
+        img_t = self.img_tf(img)
+
+        m = Image.open(self.mask_names[idx]).convert("L")
+        m.load()
+        m = self.mask_tf(m)
+        mask_t = labelids_to_trainids(m)
+
+        return img_t, mask_t, "city"
+    
 
 # ---------------------------
 # Wrapper per resize CNP

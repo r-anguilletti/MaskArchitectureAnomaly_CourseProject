@@ -9,7 +9,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from models.segmenter import AnomalySegmenter
 
 from cnp_zip_dataset import CNPZipDataset
-from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper
+from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
 
 
 def cycle(dl):
@@ -57,16 +57,26 @@ class DebugCallback(L.Callback):
         uniq = torch.unique(mask01).detach().cpu().tolist()
         anom_pct = float((mask01 == 1).float().mean().item() * 100.0)
         return anom_pct, uniq
+    
+    @staticmethod
+    def _source_to_int(source):
+        # può arrivare come: 0/1, tensor([0,0]), ["city","city"], [0,0], "city"
+        if isinstance(source, (list, tuple)):
+            source = source[0]
+
+        if torch.is_tensor(source):
+            return int(source.flatten()[0].item())
+
+        if isinstance(source, str):
+            return 0 if source == "city" else 1
+
+        return int(source)
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         img, mask, source = batch
 
         # source può essere int o tensor batchato -> portiamolo a int
-        if torch.is_tensor(source):
-            # caso tipico: tensor([0,0]) o tensor([1]) -> prendiamo il primo
-            source_i = int(source.flatten()[0].item())
-        else:
-            source_i = int(source)
+        source_i = self._source_to_int(source)
 
         if source_i == 0 and self.seen_city < 2:
             self.seen_city += 1
@@ -110,7 +120,7 @@ class DebugCallback(L.Callback):
             )
 
         img, mask, source = batch
-        source_i = int(source.flatten()[0].item()) if torch.is_tensor(source) else int(source)
+        source_i = self._source_to_int(source)
 
         if source_i == 1:
             uniq = torch.unique(mask).detach().cpu().tolist()
@@ -172,7 +182,7 @@ def main():
         drop_last=True,
     )
 
-    city_ds = CityscapesZipLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
+    city_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
     dl_city = DataLoader(
         city_ds,
         batch_size=args.batch_city,
@@ -182,7 +192,7 @@ def main():
         drop_last=True,
     )
 
-    val_ds = CityscapesZipLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
+    val_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
     dl_val = DataLoader(
         val_ds,
         batch_size=1,
