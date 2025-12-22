@@ -9,7 +9,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from models.segmenter import AnomalySegmenter
 
 from cnp_zip_dataset import CNPZipDataset
-from train_sanity import CityscapesZipLabelIdsToTrainIds, CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
+from train_sanity import CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
 
 
 def cycle(dl):
@@ -23,7 +23,7 @@ class MixedFiniteIterable(IterableDataset):
         super().__init__()
         self.city = cycle(dl_city) if dl_city is not None else None
         self.cnp = cycle(dl_cnp)
-        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # ✅ 0=city, 1=cnp
+        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # 0=city, 1=cnp
         self.steps_per_epoch = int(steps_per_epoch)
 
     def __iter__(self):
@@ -46,67 +46,35 @@ class DebugCallback(L.Callback):
         self.seen_cnp = 0
 
     @staticmethod
-    def _stats_mask_city(mask, ignore_index=255):
-        valid = (mask != ignore_index)
-        valid_pct = float(valid.float().mean().item() * 100.0)
-        uniq = torch.unique(mask[valid]).detach().cpu().tolist() if valid.any() else []
-        return valid_pct, uniq[:25]
-
-    @staticmethod
-    def _stats_mask_cnp(mask01):
-        uniq = torch.unique(mask01).detach().cpu().tolist()
-        anom_pct = float((mask01 == 1).float().mean().item() * 100.0)
-        return anom_pct, uniq
-
-    @staticmethod
     def _source_to_int(source):
-        # può arrivare come: 0/1, tensor([0,0]), ["city","city"], [0,0], "city"
         if isinstance(source, (list, tuple)):
             source = source[0]
-
         if torch.is_tensor(source):
             return int(source.flatten()[0].item())
-
         if isinstance(source, str):
             return 0 if source == "city" else 1
-
         return int(source)
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         img, mask, source = batch
-
-        # source può essere int o tensor batchato -> portiamolo a int
         source_i = self._source_to_int(source)
 
-        if source_i == 0 and self.seen_city < 2:
+        if source_i == 0 and self.seen_city < 1:
             self.seen_city += 1
-            vp, uq = self._stats_mask_city(mask, ignore_index=pl_module.ignore_index)
-            print(
-                f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                f"valid%={vp:.1f} uniq={uq}"
-            )
+            valid = (mask != pl_module.ignore_index)
+            vp = float(valid.float().mean().item() * 100.0)
+            uq = torch.unique(mask[valid]).detach().cpu().tolist() if valid.any() else []
+            print(f"[DBG first city] img={tuple(img.shape)} mask={tuple(mask.shape)} valid%={vp:.2f} uniq(sample)={uq[:15]}")
 
-        if source_i == 1 and self.seen_cnp < 2:
+        if source_i == 1 and self.seen_cnp < 1:
             self.seen_cnp += 1
-            ap, uq = self._stats_mask_cnp(mask)
-            print(
-                f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                f"anom%={ap:.2f} uniq={uq}"
-            )
+            uq = torch.unique(mask).detach().cpu().tolist()
+            ap = float((mask == 1).float().mean().item() * 100.0)
+            print(f"[DBG first oe]   img={tuple(img.shape)} mask={tuple(mask.shape)} anom%={ap:.2f} uniq={uq}")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.global_step == 0:
-            return
-
-        if trainer.global_step % self.every_n_steps == 0:
-            metrics = trainer.callback_metrics
-            tl_ce = metrics.get("train/loss_ce")
-            tl_en = metrics.get("train/loss_energy")
-            miou = metrics.get("train/mIoU")
-            vmiou = metrics.get("val/mIoU")
-            e_sep = metrics.get("train/energy_sep")
-            e_in = metrics.get("train/energy_in")
-            e_out = metrics.get("train/energy_out")
+        if trainer.global_step and trainer.global_step % self.every_n_steps == 0:
+            m = trainer.callback_metrics
 
             def fmt(x):
                 if x is None:
@@ -118,28 +86,24 @@ class DebugCallback(L.Callback):
 
             print(
                 f"[DBG step={trainer.global_step}] "
-                f"loss_ce={fmt(tl_ce)} loss_energy={fmt(tl_en)} "
-                f"train_mIoU={fmt(miou)} val_mIoU={fmt(vmiou)} "
-                f"E_sep={fmt(e_sep)} E_in={fmt(e_in)} E_out={fmt(e_out)}"
+                f"loss_ce={fmt(m.get('train/loss_ce'))} "
+                f"loss_en={fmt(m.get('train/loss_energy'))} "
+                f"train_mIoU={fmt(m.get('train/mIoU'))} "
+                f"val_mIoU={fmt(m.get('val/mIoU'))} "
+                f"E_sep={fmt(m.get('train/energy_sep'))}"
             )
-
-        img, mask, source = batch
-        source_i = self._source_to_int(source)
-
-        if source_i == 1:
-            uniq = torch.unique(mask).detach().cpu().tolist()
-            if uniq == [0]:
-                print(f"[WARN] OE batch step={trainer.global_step} uniq=[0] (no anomalies). ...")
 
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--cnp_zip", type=str, required=True)
     ap.add_argument("--city_root", type=str, required=True)
-    ap.add_argument("--img_h", type=int, default=518)
-    ap.add_argument("--img_w", type=int, default=518)
 
-    ap.add_argument("--batch_city", type=int, default=2)
+    ap.add_argument("--img_h", type=int, default=1024)
+    ap.add_argument("--img_w", type=int, default=1024)
+
+    ap.add_argument("--batch_city", type=int, default=1)
     ap.add_argument("--batch_cnp", type=int, default=1)
     ap.add_argument("--mix_city", type=int, default=3)
     ap.add_argument("--mix_cnp", type=int, default=1)
@@ -147,32 +111,31 @@ def main():
     ap.add_argument("--steps_per_epoch", type=int, default=200)
     ap.add_argument("--max_epochs", type=int, default=3)
 
-    ap.add_argument("--lr", type=float, default=5e-5)
+    # ✅ FT LR basso
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--num_workers", type=int, default=0)
 
     ap.add_argument("--ckpt_dir", type=str, default="./checkpoints")
     ap.add_argument("--log_dir", type=str, default="./logs")
     ap.add_argument("--seed", type=int, default=0)
 
+    # energy
     ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--m_in", type=float, default=-12.0)
     ap.add_argument("--m_out", type=float, default=-6.0)
     ap.add_argument("--lambda_energy", type=float, default=0.1)
-    ap.add_argument("--gamma", type=float, default=3.0)
-    ap.add_argument("--alpha", type=float, default=5.0)
 
-    # ✅ RESUME OPTIONS
-    ap.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from last.ckpt in ckpt_dir (if exists).",
-    )
-    ap.add_argument(
-        "--ckpt_path",
-        type=str,
-        default=None,
-        help="Optional explicit checkpoint path to resume from (overrides --resume).",
-    )
+    # ✅ init weights from EoMT .bin
+    ap.add_argument("--init_from_eomt_bin", type=str, default=None)
+
+    # backbone config (DEVE MATCHARE il .bin)
+    ap.add_argument("--backbone_name", type=str, default="vit_base_patch14_reg4_dinov2")
+    ap.add_argument("--num_blocks", type=int, default=3)
+    ap.add_argument("--num_queries", type=int, default=100)
+
+    # resume lightning
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--ckpt_path", type=str, default=None)
 
     args = ap.parse_args()
 
@@ -185,10 +148,6 @@ def main():
     # ----------------------------
     # Datasets / loaders
     # ----------------------------
-    # IMPORTANT: datasets should return:
-    #   City: (img, trainIdsMask, 0)
-    #   CNP : (img, oeMask01,     1)
-
     cnp_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip), img_size=img_size)
     dl_cnp = DataLoader(
         cnp_ds,
@@ -228,8 +187,26 @@ def main():
     dl_train = DataLoader(mixed_iter, batch_size=None, num_workers=0)
 
     # ----------------------------
+    # Resume logic
+    # ----------------------------
+    resume_ckpt = None
+    if args.ckpt_path is not None:
+        resume_ckpt = args.ckpt_path
+        print(f"[RESUME] Using explicit ckpt: {resume_ckpt}")
+    elif args.resume:
+        last_path = os.path.join(args.ckpt_dir, "last.ckpt")
+        if os.path.exists(last_path):
+            resume_ckpt = last_path
+            print(f"[RESUME] Resuming from: {resume_ckpt}")
+        else:
+            print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
+
+    # ----------------------------
     # Model
     # ----------------------------
+    # Se riparti da ckpt Lightning, NON serve init_from_eomt_bin (già dentro ckpt).
+    pretrained_bin = None if resume_ckpt is not None else args.init_from_eomt_bin
+
     model = AnomalySegmenter(
         img_size=img_size,
         lr=args.lr,
@@ -237,13 +214,18 @@ def main():
         m_in=args.m_in,
         m_out=args.m_out,
         lambda_energy=args.lambda_energy,
-        gamma=args.gamma,
-        alpha=args.alpha,
-        use_balanced_energy=True,
+
+        backbone_name=args.backbone_name,
+        num_queries=args.num_queries,
+        num_blocks=args.num_blocks,
+        patch_size=16,
+
+        pretrained_eomt_bin=pretrained_bin,
+        use_lora=True,
     )
 
     # ----------------------------
-    # Callbacks
+    # Callbacks / trainer
     # ----------------------------
     ckpt = ModelCheckpoint(
         dirpath=args.ckpt_dir,
@@ -269,21 +251,6 @@ def main():
         check_val_every_n_epoch=1,
         num_sanity_val_steps=2,
     )
-
-    # ----------------------------
-    # Resume logic
-    # ----------------------------
-    resume_ckpt = None
-    if args.ckpt_path is not None:
-        resume_ckpt = args.ckpt_path
-        print(f"[RESUME] Using explicit ckpt: {resume_ckpt}")
-    elif args.resume:
-        last_path = os.path.join(args.ckpt_dir, "last.ckpt")
-        if os.path.exists(last_path):
-            resume_ckpt = last_path
-            print(f"[RESUME] Resuming from: {resume_ckpt}")
-        else:
-            print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
 
     trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val, ckpt_path=resume_ckpt)
 
