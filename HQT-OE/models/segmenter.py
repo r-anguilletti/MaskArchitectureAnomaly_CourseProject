@@ -41,10 +41,10 @@ class AnomalySegmenter(L.LightningModule):
         alpha=5.0,
         prior_momentum=0.99,
         # LoRA
-        lora_r=8,
+        lora_r=8, #16
         lora_alpha=16,
         lora_dropout=0.05,
-        lora_target_modules=("qkv",),
+        lora_target_modules=("qkv",), #target_modules = ("qkv", "proj")
         modules_to_save=("class_head", "mask_head"),
         # Stability
         clamp_logits=10.0,
@@ -230,7 +230,7 @@ class AnomalySegmenter(L.LightningModule):
                 hinge = F.relu(m_out_adapt - E) ** 2
                 loss_out = (hinge[out_mask] * w_out[out_mask]).mean()
             else:
-                loss_out = torch.mean(F.relu(self.m_out - E[out_mask]) ** 2)
+                loss_out = torch.mean(F.relu(self.m_out - E[out_mask]) ** 2) #loss_out = torch.mean((F.relu(self.m_out - E[out_mask]) ** 2) * 5.0)
 
         loss = loss_in + loss_out
 

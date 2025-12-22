@@ -57,7 +57,7 @@ class DebugCallback(L.Callback):
         uniq = torch.unique(mask01).detach().cpu().tolist()
         anom_pct = float((mask01 == 1).float().mean().item() * 100.0)
         return anom_pct, uniq
-    
+
     @staticmethod
     def _source_to_int(source):
         # può arrivare come: 0/1, tensor([0,0]), ["city","city"], [0,0], "city"
@@ -81,14 +81,18 @@ class DebugCallback(L.Callback):
         if source_i == 0 and self.seen_city < 2:
             self.seen_city += 1
             vp, uq = self._stats_mask_city(mask, ignore_index=pl_module.ignore_index)
-            print(f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                f"valid%={vp:.1f} uniq={uq}")
+            print(
+                f"[DBG first city] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
+                f"valid%={vp:.1f} uniq={uq}"
+            )
 
         if source_i == 1 and self.seen_cnp < 2:
             self.seen_cnp += 1
             ap, uq = self._stats_mask_cnp(mask)
-            print(f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
-                f"anom%={ap:.2f} uniq={uq}")
+            print(
+                f"[DBG first cnp] step={trainer.global_step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
+                f"anom%={ap:.2f} uniq={uq}"
+            )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if trainer.global_step == 0:
@@ -156,6 +160,19 @@ def main():
     ap.add_argument("--lambda_energy", type=float, default=0.1)
     ap.add_argument("--gamma", type=float, default=3.0)
     ap.add_argument("--alpha", type=float, default=5.0)
+
+    # ✅ RESUME OPTIONS
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from last.ckpt in ckpt_dir (if exists).",
+    )
+    ap.add_argument(
+        "--ckpt_path",
+        type=str,
+        default=None,
+        help="Optional explicit checkpoint path to resume from (overrides --resume).",
+    )
 
     args = ap.parse_args()
 
@@ -253,7 +270,22 @@ def main():
         num_sanity_val_steps=2,
     )
 
-    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val)
+    # ----------------------------
+    # Resume logic
+    # ----------------------------
+    resume_ckpt = None
+    if args.ckpt_path is not None:
+        resume_ckpt = args.ckpt_path
+        print(f"[RESUME] Using explicit ckpt: {resume_ckpt}")
+    elif args.resume:
+        last_path = os.path.join(args.ckpt_dir, "last.ckpt")
+        if os.path.exists(last_path):
+            resume_ckpt = last_path
+            print(f"[RESUME] Resuming from: {resume_ckpt}")
+        else:
+            print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
+
+    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val, ckpt_path=resume_ckpt)
 
 
 if __name__ == "__main__":
