@@ -16,7 +16,7 @@ from models.segmenter import AnomalySegmenter
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
-IMG_SIZE = (518, 518)
+IMG_SIZE = (1024, 1024)
 NUM_CLASSES = 19
 IGNORE_LABEL = 255
 
