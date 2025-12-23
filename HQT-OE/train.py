@@ -2,12 +2,11 @@
 import os
 import argparse
 import torch
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, Subset
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from models.segmenter import AnomalySegmenter
-
 from cnp_zip_dataset import CNPZipDataset
 from train_sanity import CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
 
@@ -19,6 +18,9 @@ def cycle(dl):
 
 
 class MixedFiniteIterable(IterableDataset):
+    """
+    Mixa City (ID) e CNP (OE/OOD) in un pattern fisso, per un numero finito di step/epoch.
+    """
     def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
         super().__init__()
         self.city = cycle(dl_city) if dl_city is not None else None
@@ -89,15 +91,29 @@ class DebugCallback(L.Callback):
                 f"loss_ce={fmt(m.get('train/loss_ce'))} "
                 f"loss_en={fmt(m.get('train/loss_energy'))} "
                 f"train_mIoU={fmt(m.get('train/mIoU'))} "
-                f"val_mIoU={fmt(m.get('val/mIoU'))} "
+                f"val_mIoU={fmt(m.get('val_city/mIoU'))} "
                 f"E_sep={fmt(m.get('train/energy_sep'))}"
             )
+
+
+def _maybe_subset(ds, limit: int):
+    if limit is None or limit <= 0:
+        return ds
+    try:
+        n = len(ds)
+        k = min(int(limit), int(n))
+        return Subset(ds, list(range(k)))
+    except Exception:
+        return ds
 
 
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--cnp_zip", type=str, required=True)
+    # ✅ split CNP (best practice)
+    ap.add_argument("--cnp_zip_train", type=str, required=True, help="Path to CNP train zip (80%)")
+    ap.add_argument("--cnp_zip_val", type=str, default=None, help="Path to CNP val zip (20%) (optional)")
+
     ap.add_argument("--city_root", type=str, required=True)
 
     ap.add_argument("--img_h", type=int, default=1024)
@@ -111,7 +127,6 @@ def main():
     ap.add_argument("--steps_per_epoch", type=int, default=200)
     ap.add_argument("--max_epochs", type=int, default=3)
 
-    # ✅ FT LR basso
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--num_workers", type=int, default=0)
 
@@ -119,16 +134,20 @@ def main():
     ap.add_argument("--log_dir", type=str, default="./logs")
     ap.add_argument("--seed", type=int, default=0)
 
+    # ✅ limit validation images (PER DATASET)
+    ap.add_argument("--val_limit", type=int, default=500,
+                    help="Limit number of validation images PER dataset (City val and CNP val)")
+
     # energy
     ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--m_in", type=float, default=-12.0)
     ap.add_argument("--m_out", type=float, default=-6.0)
     ap.add_argument("--lambda_energy", type=float, default=0.1)
 
-    # ✅ init weights from EoMT .bin
+    # init weights from EoMT .bin
     ap.add_argument("--init_from_eomt_bin", type=str, default=None)
 
-    # backbone config (DEVE MATCHARE il .bin)
+    # backbone config (must match .bin)
     ap.add_argument("--backbone_name", type=str, default="vit_base_patch14_reg4_dinov2")
     ap.add_argument("--num_blocks", type=int, default=3)
     ap.add_argument("--num_queries", type=int, default=100)
@@ -136,6 +155,10 @@ def main():
     # resume lightning
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--ckpt_path", type=str, default=None)
+
+    # ✅ validate-only
+    ap.add_argument("--eval_only", action="store_true",
+                    help="Run validation only on BOTH (City val + CNP val if provided) then exit")
 
     args = ap.parse_args()
 
@@ -148,9 +171,10 @@ def main():
     # ----------------------------
     # Datasets / loaders
     # ----------------------------
-    cnp_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip), img_size=img_size)
-    dl_cnp = DataLoader(
-        cnp_ds,
+    # CNP train (OE)
+    cnp_train_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_train), img_size=img_size)
+    dl_cnp_train = DataLoader(
+        cnp_train_ds,
         batch_size=args.batch_cnp,
         shuffle=True,
         num_workers=args.num_workers,
@@ -158,9 +182,24 @@ def main():
         drop_last=True,
     )
 
-    city_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
+    # CNP val (OOD)
+    dl_cnp_val = None
+    if args.cnp_zip_val is not None:
+        cnp_val_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_val), img_size=img_size)
+        cnp_val_ds = _maybe_subset(cnp_val_ds, args.val_limit)
+        dl_cnp_val = DataLoader(
+            cnp_val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
+
+    # City train
+    city_train_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
     dl_city = DataLoader(
-        city_ds,
+        city_train_ds,
         batch_size=args.batch_city,
         shuffle=True,
         num_workers=args.num_workers,
@@ -168,18 +207,21 @@ def main():
         drop_last=True,
     )
 
-    val_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
-    dl_val = DataLoader(
-        val_ds,
+    # City val
+    city_val_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
+    city_val_ds = _maybe_subset(city_val_ds, args.val_limit)
+    dl_city_val = DataLoader(
+        city_val_ds,
         batch_size=1,
         shuffle=False,
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
 
+    # Mixed finite iterator for training
     mixed_iter = MixedFiniteIterable(
         dl_city=dl_city,
-        dl_cnp=dl_cnp,
+        dl_cnp=dl_cnp_train,
         mix_city=args.mix_city,
         mix_cnp=args.mix_cnp,
         steps_per_epoch=args.steps_per_epoch,
@@ -201,12 +243,12 @@ def main():
         else:
             print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
 
+    # If resuming from Lightning ckpt, don't re-init from bin
+    pretrained_bin = None if resume_ckpt is not None else args.init_from_eomt_bin
+
     # ----------------------------
     # Model
     # ----------------------------
-    # Se riparti da ckpt Lightning, NON serve init_from_eomt_bin (già dentro ckpt).
-    pretrained_bin = None if resume_ckpt is not None else args.init_from_eomt_bin
-
     model = AnomalySegmenter(
         img_size=img_size,
         lr=args.lr,
@@ -214,12 +256,11 @@ def main():
         m_in=args.m_in,
         m_out=args.m_out,
         lambda_energy=args.lambda_energy,
-
         backbone_name=args.backbone_name,
         num_queries=args.num_queries,
         num_blocks=args.num_blocks,
         patch_size=16,
-
+        train_epochs=args.max_epochs,
         pretrained_eomt_bin=pretrained_bin,
         use_lora=True,
     )
@@ -232,7 +273,7 @@ def main():
         filename="seg-{epoch:02d}-{step:06d}",
         save_last=True,
         save_top_k=2,
-        monitor="val/mIoU",
+        monitor="val_city/mIoU",
         mode="max",
     )
     lrmon = LearningRateMonitor(logging_interval="step")
@@ -252,7 +293,34 @@ def main():
         num_sanity_val_steps=2,
     )
 
-    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=dl_val, ckpt_path=resume_ckpt)
+    # ----------------------------
+    # ✅ Eval-only on BOTH via Lightning (progress bar per dataloader)
+    # ----------------------------
+    if args.eval_only:
+        val_loaders = [dl_city_val]
+        if dl_cnp_val is not None:
+            val_loaders.append(dl_cnp_val)
+
+        print("\n[INFO] Running validation ONLY on BOTH (City val + CNP val)...\n")
+        results = trainer.validate(
+            model,
+            dataloaders=val_loaders,
+            ckpt_path=resume_ckpt,
+            verbose=True,
+        )
+
+        print("\n[INFO] Validate returned:")
+        print(results)
+        return
+
+    # ----------------------------
+    # Fit (train + validate on BOTH each epoch)
+    # ----------------------------
+    val_loaders = [dl_city_val]
+    if dl_cnp_val is not None:
+        val_loaders.append(dl_cnp_val)
+
+    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=val_loaders, ckpt_path=resume_ckpt)
 
 
 if __name__ == "__main__":

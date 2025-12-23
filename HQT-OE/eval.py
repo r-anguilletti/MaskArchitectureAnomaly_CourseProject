@@ -1,228 +1,243 @@
+# eval_my_model.py
 import os
+import sys
 import glob
+import random
 import torch
 import numpy as np
 import torch.nn.functional as F
 from PIL import Image
 from argparse import ArgumentParser
-from sklearn.metrics import roc_curve, average_precision_score
-from torchvision.transforms import v2 as T
-from tqdm import tqdm
-from scipy.ndimage import gaussian_filter
+from sklearn.metrics import average_precision_score, roc_curve
+from torchvision.transforms import Compose, Resize, ToTensor
 
-from models.segmenter import AnomalySegmenter
+# -----------------------------------------------------------------------------
+# SETUP PATH & IMPORTS
+# -----------------------------------------------------------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
+
+# Assumendo che questo script stia dentro: HQT-OE/eval/ oppure HQT-OE/
+# e che "models/" sia sotto HQT-OE/
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from models.segmenter import AnomalySegmenter  # <-- il TUO modello
 
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
-IMG_SIZE = (1024, 1024)
+# -----------------------------------------------------------------------------
+# CONFIGURAZIONE & PARAMETRI (default, ma puoi override via args)
+# -----------------------------------------------------------------------------
+SEED = 42
 NUM_CLASSES = 19
-IGNORE_LABEL = 255
 
 
-# ------------------------------------------------------------
-# TRANSFORMS
-# ------------------------------------------------------------
-input_transform = T.Compose([
-    T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BILINEAR),
-    T.ToImage(),
-    T.ToDtype(torch.float32, scale=True),
-    T.Normalize(mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]),
-])
-
-target_transform = T.Compose([
-    T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.NEAREST),
-])
-
-
-# ------------------------------------------------------------
-# METRICS
-# ------------------------------------------------------------
-def fpr_at_95_tpr(scores, labels):
+# -----------------------------------------------------------------------------
+# FUNZIONI DI UTILITÀ
+# -----------------------------------------------------------------------------
+def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
-    if len(tpr) == 0:
+    idxs = np.where(tpr >= 0.95)[0]
+    if len(idxs) == 0:
         return 1.0
-    idx = np.where(tpr >= 0.95)[0]
-    return float(fpr[idx[0]]) if len(idx) > 0 else 1.0
+    return float(fpr[idxs[0]])
 
 
-def compute_anomaly_map(logits, method):
+def compute_anomaly_map(logits_chw: torch.Tensor, method: str) -> torch.Tensor:
     """
-    logits: (C=19, H, W)
-    returns: anomaly score map (H, W)
+    logits_chw: [C,H,W] (Cityscapes classes)
     """
-    if method == "energy":
-        return -torch.logsumexp(logits, dim=0)
+    probs = F.softmax(logits_chw, dim=0)
 
-    elif method == "msp":
-        probs = F.softmax(logits, dim=0)
-        return 1.0 - probs.max(dim=0).values
+    if method == "msp":
+        msp = probs.max(dim=0).values
+        anomaly_map = 1.0 - msp
 
     elif method == "maxlogit":
-        return -logits.max(dim=0).values
+        maxlogit = logits_chw.max(dim=0).values
+        anomaly_map = -maxlogit
 
-    elif method == "entropy":
-        probs = F.softmax(logits, dim=0)
+    elif method == "maxentropy":
         eps = 1e-8
-        return -(probs * (probs + eps).log()).sum(dim=0)
+        entropy = -(probs * (probs + eps).log()).sum(dim=0)
+        anomaly_map = entropy
+
+    elif method == "rba":
+        msp = probs.max(dim=0).values
+        accept_threshold = 0.5
+        anomaly_map = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
 
     else:
-        raise ValueError(f"Unknown method {method}")
+        raise ValueError(f"Metodo anomalia non supportato: {method}")
+
+    return anomaly_map
 
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
-def main():
-    parser = ArgumentParser()
-    parser.add_argument("--input", nargs="+", required=True,
-                        help="Glob immagini")
-    parser.add_argument("--ckpt", required=True,
-                        help="Checkpoint del modello")
-    parser.add_argument("--method", default="energy",
-                        choices=["energy", "msp", "maxlogit", "entropy"])
-    parser.add_argument("--smooth_sigma", type=float, default=0.0,
-                        help="Gaussian smoothing sigma (0 = off)")
-    parser.add_argument("--debug_n", type=int, default=3,
-                        help="Numero immagini con debug GT")
-    args = parser.parse_args()
+def load_my_model(ckpt_path: str, device: torch.device) -> AnomalySegmenter:
+    """
+    Carica il tuo LightningModule AnomalySegmenter dal .ckpt.
+    """
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint non trovato: {ckpt_path}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Se hai usato self.save_hyperparameters() nel modello (sì), questo funziona.
+    model = AnomalySegmenter.load_from_checkpoint(
+        ckpt_path,
+        map_location="cpu",  # carico CPU, poi .to(device)
+        strict=True,
+    )
 
-    print(f"\n--- Eval config | device={device} | method={args.method} ---\n")
-
-    # -------------------------
-    # LOAD MODEL
-    # -------------------------
-    print("--> Loading model...")
-    model = AnomalySegmenter.load_from_checkpoint(args.ckpt)
     model.to(device)
     model.eval()
+    return model
 
-    # -------------------------
-    # COLLECT FILES
-    # -------------------------
-    files = []
-    for p in args.input:
-        files.extend(glob.glob(os.path.expanduser(p), recursive=True))
-    files = sorted(set(files))
 
-    print(f"Trovate {len(files)} immagini")
-    if len(files) == 0:
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main():
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--input",
+        nargs="+",
+        default="/home/shyam/Mask2Former/unk-eval/RoadObsticle21/images/*.webp",
+        help="Path o glob pattern immagini input",
+    )
+
+    parser.add_argument("--ckpt_dir", default="./checkpoints/", help="Cartella checkpoint Lightning")
+    parser.add_argument("--ckpt_name", default="last.ckpt", help="Nome checkpoint (es: last.ckpt o seg-xx-xxxxxx.ckpt)")
+
+    parser.add_argument("--img_h", type=int, default=1024)
+    parser.add_argument("--img_w", type=int, default=1024)
+
+    parser.add_argument("--method", default="msp", choices=["msp", "maxlogit", "maxentropy", "rba"])
+    parser.add_argument("--cpu", action="store_true")
+    args = parser.parse_args()
+
+    # Reproducibility
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    IMG_SIZE = (args.img_h, args.img_w)
+
+    input_transform = Compose([
+        Resize(IMG_SIZE, Image.BILINEAR),
+        ToTensor(),
+    ])
+    target_transform = Compose([
+        Resize(IMG_SIZE, Image.NEAREST),
+    ])
+
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    print(f"Device in uso: {device}")
+
+    if not os.path.exists("results.txt"):
+        open("results.txt", "w").close()
+
+    ckpt_full_path = os.path.join(args.ckpt_dir, args.ckpt_name)
+    print(f"Caricamento ckpt da: {ckpt_full_path}")
+
+    try:
+        model = load_my_model(ckpt_full_path, device)
+        print("✅ Modello caricato con successo.")
+    except Exception as e:
+        print(f"❌ Errore critico nel caricamento del modello: {e}")
         return
 
-    anomaly_maps = []
-    gt_maps = []
+    anomaly_score_list = []
+    ood_gts_list = []
 
-    # -------------------------
-    # LOOP
-    # -------------------------
-    for idx, path in enumerate(tqdm(files, desc="Processing")):
-        try:
-            img = Image.open(path).convert("RGB")
-        except Exception:
-            continue
+    file_list = glob.glob(os.path.expanduser(str(args.input[0])))
+    print(f"Trovate {len(file_list)} immagini da elaborare.")
 
-        img_t = input_transform(img).unsqueeze(0).to(device)
+    for path in file_list:
+        print(f"Processing: {path}")
+
+        img_pil = Image.open(path).convert("RGB")
+        img_tensor = input_transform(img_pil).unsqueeze(0).float().to(device)
 
         with torch.no_grad():
-            logits = model(img_t)[0]   # (19, H, W)
-            anomaly = compute_anomaly_map(logits, args.method)
+            # Il tuo forward ritorna già seg_logits [B,C,H,W]
+            logits_bchw = model(img_tensor).float()
+            pixel_logits = logits_bchw[0]  # [C,H,W]
 
-            if args.smooth_sigma > 0:
-                anomaly = torch.from_numpy(
-                    gaussian_filter(anomaly.cpu().numpy(), sigma=args.smooth_sigma)
-                ).to(device)
+            anomaly_map = compute_anomaly_map(pixel_logits, args.method)
+            anomaly_np = anomaly_map.detach().cpu().numpy()
 
-            anomaly = anomaly.cpu().numpy()
+        # --- GT path mapping ---
+        pathGT = path.replace("images", "labels_masks")
+        if "RoadObsticle21" in pathGT:
+            pathGT = pathGT.replace("webp", "png")
+        if "fs_static" in pathGT:
+            pathGT = pathGT.replace("jpg", "png")
+        if "RoadAnomaly" in pathGT:
+            pathGT = pathGT.replace("jpg", "png")
 
-        # -------------------------
-        # GT PATH + MAPPING
-        # -------------------------
-        pathGT = None
-
-        if "RoadAnomaly21" in path or "RoadObsticle21" in path:
-            cand = path.replace("images", "labels_masks")
-            cand = os.path.splitext(cand)[0] + ".png"
-            if os.path.exists(cand):
-                pathGT = cand
-
-        elif "RoadAnomaly" in path:
-            cand = path.replace(".jpg", ".labels.png")
-            if os.path.exists(cand):
-                pathGT = cand
-
-        elif "leftImg8bit" in path:
-            cand = path.replace("leftImg8bit", "gtCoarse")
-            cand = cand.replace("_leftImg8bit", "_gtCoarse_labelIds")
-            cand = os.path.splitext(cand)[0] + ".png"
-            if os.path.exists(cand):
-                pathGT = cand
-
-        if pathGT is None:
+        try:
+            gt_img = Image.open(pathGT)
+        except FileNotFoundError:
+            print(f"Warning: GT non trovata per {path}, skip.")
             continue
 
-        gt = Image.open(pathGT)
-        gt = target_transform(gt)
-        gt = np.array(gt)
+        gt_img = target_transform(gt_img)
+        ood_gts = np.array(gt_img)
 
-        new_gt = np.ones_like(gt) * IGNORE_LABEL
+        # --- dataset-specific relabeling ---
+        if "RoadAnomaly" in pathGT:
+            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
 
-        # RoadAnomaly21 / RoadObsticle21
-        if "RoadAnomaly21" in pathGT or "RoadObsticle21" in pathGT:
-            new_gt[gt == 0] = 0
-            new_gt[gt == 1] = 1
+        elif "LostAndFound" in pathGT:
+            ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+            ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+            ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
 
-        # Old RoadAnomaly
-        elif "RoadAnomaly" in pathGT:
-            new_gt[gt == 1] = 0
-            new_gt[gt == 2] = 1
+        elif "Streethazard" in pathGT:
+            ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+            ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
 
-        # LostAndFound / Fishyscapes
-        else:
-            new_gt[gt == 1] = 0
-            new_gt[gt > 1] = 1
+        # skip immagini senza OOD
+        if 1 not in np.unique(ood_gts):
+            continue
 
-        if idx < args.debug_n:
-            uniq, cnt = np.unique(new_gt, return_counts=True)
-            print(f"[DBG GT IMAGE] {pathGT}")
-            print(" uniq:", dict(zip(uniq.tolist(), cnt.tolist())))
+        ood_gts_list.append(ood_gts)
+        anomaly_score_list.append(anomaly_np)
 
-        anomaly_maps.append(anomaly)
-        gt_maps.append(new_gt)
+        del img_tensor, anomaly_map, pixel_logits, logits_bchw
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # -------------------------
-    # STACK & FILTER
-    # -------------------------
-    gt_all = np.stack(gt_maps)
-    score_all = np.stack(anomaly_maps)
+    if not ood_gts_list:
+        print("Nessun dato valido raccolto per la valutazione.")
+        return
 
-    valid = gt_all != IGNORE_LABEL
-    labels = gt_all[valid]
-    scores = score_all[valid]
+    print("Calcolo metriche in corso...")
 
-    print("\n--- DEBUG GT DISTRIBUTION ---")
-    uniq, cnt = np.unique(labels, return_counts=True)
-    print("GT labels:", dict(zip(uniq.tolist(), cnt.tolist())))
-    print("Anomaly %:", 100.0 * (labels == 1).mean())
+    ood_gts_flat = np.array(ood_gts_list)
+    anomaly_scores_flat = np.array(anomaly_score_list)
 
-    print("\n--- DEBUG SCORE STATS ---")
-    print("scores min/max/mean:",
-          scores.min(), scores.max(), scores.mean())
-    print("mean score ID  :", scores[labels == 0].mean())
-    print("mean score OOD :", scores[labels == 1].mean())
+    # ignora 255 se presente
+    valid_mask = (ood_gts_flat != 255)
+    ood_mask = (ood_gts_flat == 1) & valid_mask
+    ind_mask = (ood_gts_flat == 0) & valid_mask
 
-    # -------------------------
-    # METRICS
-    # -------------------------
-    auprc = average_precision_score(labels, scores)
-    fpr95 = fpr_at_95_tpr(scores, labels)
+    ood_scores = anomaly_scores_flat[ood_mask]
+    ind_scores = anomaly_scores_flat[ind_mask]
 
-    print("\n--- METRICS ---")
-    print(f"[{args.method.upper()}] AuPRC={auprc*100:.2f}% | "
-          f"FPR@95={fpr95*100:.2f}%")
+    all_scores = np.concatenate((ind_scores, ood_scores))
+    all_labels = np.concatenate((np.zeros(len(ind_scores)), np.ones(len(ood_scores))))
+
+    auprc = average_precision_score(all_labels, all_scores)
+    fpr95 = fpr_at_95_tpr(all_scores, all_labels)
+
+    result_str = f"[MYMODEL-{args.method}] AUPRC: {auprc * 100.0:.2f}% | FPR@95TPR: {fpr95 * 100.0:.2f}%"
+    print("\n" + "=" * 50)
+    print(result_str)
+    print("=" * 50 + "\n")
+
+    with open("results.txt", "a") as f:
+        f.write("\n" + result_str)
 
 
 if __name__ == "__main__":
