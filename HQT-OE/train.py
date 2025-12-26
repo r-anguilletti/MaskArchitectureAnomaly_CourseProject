@@ -273,7 +273,7 @@ def main():
         filename="seg-{epoch:02d}-{step:06d}",
         save_last=True,
         save_top_k=2,
-        monitor="val_city/mIoU",
+        monitor="val_city/mIoU/dataloader_idx_0",
         mode="max",
     )
     lrmon = LearningRateMonitor(logging_interval="step")
