@@ -257,13 +257,14 @@ class AnomalySegmenter(L.LightningModule):
         img, mask, source = batch
         source = self._source_to_int(source)
 
+        # ✅ logits SEMPRE calcolati prima di qualsiasi ramo
+        logits = self(img).float()
+
         # ----------------------------
-        # City (ID): CE on forward logits
+        # City (ID)
         # ----------------------------
         if source == 0:
-            logits = self(img).float()
             loss_ce = self.ce_loss(logits, mask)
-
             preds = torch.argmax(logits, dim=1)
             valid = (mask != self.ignore_index)
             if valid.any():
@@ -275,23 +276,21 @@ class AnomalySegmenter(L.LightningModule):
             return loss_ce
 
         # ----------------------------
-        # CNP / OE (OOD): Energy on pseudo-logits from seg_probs (aligned with eval)
+        # CNP / OE (OOD) + WARM-UP
         # ----------------------------
-        seg_probs = self.seg_probs_eomt_style(img)
-        pseudo_logits = torch.log(seg_probs.clamp_min(1e-6)).float()
-        if self.clamp_logits > 0:
-            pseudo_logits = pseudo_logits.clamp(-self.clamp_logits, self.clamp_logits)
-
-        # warmup: ignore energy loss
         if getattr(self, "warmup_epochs", 0) and self.current_epoch < self.warmup_epochs:
             bs = img.shape[0]
-            zero = torch.tensor(0.0, device=img.device)
+
+            # ✅ zero differenziabile (collegato al grafo)
+            zero = logits.sum() * 0.0
+
             self.log("train/loss_energy", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/energy_sep", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/is_warmup", 1.0, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
             return zero
 
-        loss_e, *_ , sep = self.energy_loss(pseudo_logits, mask)
+        # dopo warmup: energy loss normale
+        loss_e, *_ , sep = self.energy_loss(logits, mask)
         loss = self.lambda_energy * loss_e
 
         bs = img.shape[0]

@@ -144,6 +144,14 @@ def main():
     ap.add_argument("--m_out", type=float, default=-6.0)
     ap.add_argument("--lambda_energy", type=float, default=0.1)
 
+    # ✅ NEW: warmup epochs for OE / energy loss
+    ap.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=0,
+        help="Number of initial epochs where OE/energy loss is disabled (warmup on City only).",
+    )
+
     # init weights from EoMT .bin
     ap.add_argument("--init_from_eomt_bin", type=str, default=None)
 
@@ -256,6 +264,7 @@ def main():
         m_in=args.m_in,
         m_out=args.m_out,
         lambda_energy=args.lambda_energy,
+        warmup_epochs=args.warmup_epochs,   # ✅ NEW
         backbone_name=args.backbone_name,
         num_queries=args.num_queries,
         num_blocks=args.num_blocks,
