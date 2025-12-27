@@ -36,6 +36,8 @@ class AnomalySegmenter(L.LightningModule):
         m_out=-6.0,
         lambda_energy=0.1,
 
+        warmup_epochs=2,
+
         # LoRA
         use_lora=True,
         lora_r=8,
@@ -57,6 +59,7 @@ class AnomalySegmenter(L.LightningModule):
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.train_epochs = int(train_epochs)
+        self.warmup_epochs = int(warmup_epochs)
 
         self.T = float(T)
         self.m_in = float(m_in)
@@ -108,12 +111,13 @@ class AnomalySegmenter(L.LightningModule):
             average="macro",
         )
 
-        # OOD metric
+        # OOD metric (AUPRC su MSP anomaly)
         self.val_ood_auprc_msp = BinaryAveragePrecision()
-
-        # ✅ NEW: track whether we ever called update() during this validation epoch
         self._ood_metric_updated = False
 
+    # ----------------------------
+    # Loading / LoRA
+    # ----------------------------
     def _load_eomt_bin(self, bin_path: str):
         if not os.path.exists(bin_path):
             raise FileNotFoundError(f"[LOAD_EOMT_BIN] not found: {bin_path}")
@@ -151,9 +155,9 @@ class AnomalySegmenter(L.LightningModule):
             return 0 if source == "city" else 1
         return int(source)
 
-   # ----------------------------
+    # ----------------------------
     # Forward -> per-pixel logits (B,C,H,W)
-    # IMPORTANT: use EoMT/Mask2Former probabilistic composition
+    # IMPORTANT: probabilistic composition (Mask2Former-style)
     # ----------------------------
     def forward(self, x):
         mask_logits_layers, class_logits_layers = self.model(x)
@@ -179,22 +183,38 @@ class AnomalySegmenter(L.LightningModule):
 
         # convert to logits for CE; keep numerically stable
         seg_logits = torch.log(seg_probs.clamp_min(1e-6))
-
         if self.clamp_logits > 0:
             seg_logits = seg_logits.clamp(-self.clamp_logits, self.clamp_logits)
 
         return seg_logits
 
     # ----------------------------
-    # OOD scores
+    # EoMT-style seg_probs (for OOD metrics aligned with eval_my_model.py)
+    # ----------------------------
+    @torch.no_grad()
+    def seg_probs_eomt_style(self, x: torch.Tensor) -> torch.Tensor:
+        mask_logits_layers, class_logits_layers = self.model(x)
+        mask_logits = mask_logits_layers[-1]
+        class_logits = class_logits_layers[-1]
+
+        if mask_logits.shape[-2:] != x.shape[-2:]:
+            mask_logits = F.interpolate(mask_logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        if class_logits.shape[-1] == self.num_id_classes + 1:
+            class_logits = class_logits[..., : self.num_id_classes]
+        else:
+            class_logits = class_logits[..., : self.num_id_classes]
+
+        mask_probs = mask_logits.sigmoid()
+        class_probs = torch.softmax(class_logits, dim=-1)
+        seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+        return seg_probs
+
+    # ----------------------------
+    # OOD scores (energy on pseudo-logits = log(seg_probs))
     # ----------------------------
     def energy_map(self, logits):
         return -self.T * torch.logsumexp(logits / self.T, dim=1)  # (B,H,W)
-
-    def msp_anomaly(self, logits):
-        probs = torch.softmax(logits, dim=1)
-        msp = probs.max(dim=1).values
-        return 1.0 - msp
 
     def _sample_pixels(self, scores, targets01, max_pixels):
         s = scores.reshape(-1)
@@ -206,7 +226,7 @@ class AnomalySegmenter(L.LightningModule):
         return s[idx], t[idx]
 
     # ----------------------------
-    # Energy loss (train)
+    # Energy loss (train) on pseudo-logits
     # ----------------------------
     def energy_loss(self, logits, oe_mask01):
         E = self.energy_map(logits)
@@ -237,10 +257,13 @@ class AnomalySegmenter(L.LightningModule):
         img, mask, source = batch
         source = self._source_to_int(source)
 
-        logits = self(img).float()
-
+        # ----------------------------
+        # City (ID): CE on forward logits
+        # ----------------------------
         if source == 0:
+            logits = self(img).float()
             loss_ce = self.ce_loss(logits, mask)
+
             preds = torch.argmax(logits, dim=1)
             valid = (mask != self.ignore_index)
             if valid.any():
@@ -250,14 +273,32 @@ class AnomalySegmenter(L.LightningModule):
             self.log("train/loss_ce", loss_ce, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/mIoU", self.train_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
             return loss_ce
-        else:
-            loss_e, *_ , sep = self.energy_loss(logits, mask)
-            loss = self.lambda_energy * loss_e
 
+        # ----------------------------
+        # CNP / OE (OOD): Energy on pseudo-logits from seg_probs (aligned with eval)
+        # ----------------------------
+        seg_probs = self.seg_probs_eomt_style(img)
+        pseudo_logits = torch.log(seg_probs.clamp_min(1e-6)).float()
+        if self.clamp_logits > 0:
+            pseudo_logits = pseudo_logits.clamp(-self.clamp_logits, self.clamp_logits)
+
+        # warmup: ignore energy loss
+        if getattr(self, "warmup_epochs", 0) and self.current_epoch < self.warmup_epochs:
             bs = img.shape[0]
-            self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
-            self.log("train/energy_sep", sep, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
-            return loss
+            zero = torch.tensor(0.0, device=img.device)
+            self.log("train/loss_energy", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/energy_sep", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/is_warmup", 1.0, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+            return zero
+
+        loss_e, *_ , sep = self.energy_loss(pseudo_logits, mask)
+        loss = self.lambda_energy * loss_e
+
+        bs = img.shape[0]
+        self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        self.log("train/energy_sep", sep, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        self.log("train/is_warmup", 0.0, prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
+        return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """
@@ -265,57 +306,66 @@ class AnomalySegmenter(L.LightningModule):
         dataloader_idx=1 -> CNP val (OOD mask 0/1)
         """
         img, mask, source = batch
-        logits = self(img).float()
 
         # ----------------------------
         # Cityscapes val
         # ----------------------------
         if dataloader_idx == 0:
+            logits = self(img).float()
             loss = self.ce_loss(logits, mask)
+
             preds = torch.argmax(logits, dim=1)
             valid = (mask != self.ignore_index)
             if valid.any():
                 self.val_miou(preds[valid], mask[valid])
 
             bs = img.shape[0]
-            self.log("val_city/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
-            self.log("val_city/mIoU", self.val_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+            # IMPORTANT: no dataloader_idx suffixes
+            self.log("val_city/loss", loss, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
+            self.log("val_city/mIoU", self.val_miou, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
             return loss
 
         # ----------------------------
-        # CNP val (OOD)
-        # mask in {0,1}
+        # CNP val (OOD) - PROF/EoMT STYLE (match eval_my_model.py)
         # ----------------------------
         with torch.no_grad():
-            msp_score = self.msp_anomaly(logits)  # (B,H,W)
-            E = self.energy_map(logits)           # (B,H,W)
+            seg_probs = self.seg_probs_eomt_style(img)   # (B,C,H,W)
+
+            msp = seg_probs.max(dim=1).values            # (B,H,W)
+            msp_score = 1.0 - msp                        # (B,H,W)
+
+            pseudo_logits = torch.log(seg_probs.clamp_min(1e-6))
+            E = self.energy_map(pseudo_logits)           # (B,H,W)
 
             in_mask = (mask == 0)
             out_mask = (mask == 1)
 
-            msp_in = msp_score[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=logits.device)
-            msp_out = msp_score[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=logits.device)
+            msp_in = msp_score[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=img.device)
+            msp_out = msp_score[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=img.device)
             msp_sep = msp_out - msp_in
 
-            e_in = E[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=logits.device)
-            e_out = E[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=logits.device)
+            e_in = E[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=img.device)
+            e_out = E[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=img.device)
             e_sep = e_out - e_in
 
             bs = img.shape[0]
-            self.log("val_ood/msp_sep", msp_sep, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
-            self.log("val_ood/energy_sep", e_sep, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+            self.log("val_ood/msp_sep", msp_sep, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
+            self.log("val_ood/energy_sep", e_sep, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
 
             if in_mask.any() and out_mask.any():
                 s, t = self._sample_pixels(msp_score, mask, self.ood_val_sample_pixels)
                 self.val_ood_auprc_msp.update(s, t)
-                # ✅ NEW
                 self._ood_metric_updated = True
 
     def on_validation_epoch_end(self):
-        # ✅ Only compute if we actually updated
         if self._ood_metric_updated:
             auprc = self.val_ood_auprc_msp.compute()
-            self.log("val_ood/auprc_msp", auprc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_ood/auprc_msp", auprc, prog_bar=True, on_step=False, on_epoch=True,
+                     add_dataloader_idx=False)
 
         self.val_ood_auprc_msp.reset()
         self._ood_metric_updated = False

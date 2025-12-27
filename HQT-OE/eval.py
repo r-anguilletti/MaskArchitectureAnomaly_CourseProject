@@ -17,23 +17,20 @@ from torchvision.transforms import Compose, Resize, ToTensor
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
 
-# Assumendo che questo script stia dentro: HQT-OE/eval/ oppure HQT-OE/
-# e che "models/" sia sotto HQT-OE/
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.segmenter import AnomalySegmenter  # <-- il TUO modello
 
-
 # -----------------------------------------------------------------------------
-# CONFIGURAZIONE & PARAMETRI (default, ma puoi override via args)
+# CONFIG
 # -----------------------------------------------------------------------------
 SEED = 42
 NUM_CLASSES = 19
 
 
 # -----------------------------------------------------------------------------
-# FUNZIONI DI UTILITÀ
+# UTILS
 # -----------------------------------------------------------------------------
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
@@ -43,53 +40,82 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     return float(fpr[idxs[0]])
 
 
-def compute_anomaly_map(logits_chw: torch.Tensor, method: str) -> torch.Tensor:
-    """
-    logits_chw: [C,H,W] (Cityscapes classes)
-    """
-    probs = F.softmax(logits_chw, dim=0)
-
-    if method == "msp":
-        msp = probs.max(dim=0).values
-        anomaly_map = 1.0 - msp
-
-    elif method == "maxlogit":
-        maxlogit = logits_chw.max(dim=0).values
-        anomaly_map = -maxlogit
-
-    elif method == "maxentropy":
-        eps = 1e-8
-        entropy = -(probs * (probs + eps).log()).sum(dim=0)
-        anomaly_map = entropy
-
-    elif method == "rba":
-        msp = probs.max(dim=0).values
-        accept_threshold = 0.5
-        anomaly_map = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
-
-    else:
-        raise ValueError(f"Metodo anomalia non supportato: {method}")
-
-    return anomaly_map
-
-
 def load_my_model(ckpt_path: str, device: torch.device) -> AnomalySegmenter:
     """
-    Carica il tuo LightningModule AnomalySegmenter dal .ckpt.
+    Carica il tuo LightningModule dal .ckpt SENZA ricaricare il .bin.
+    IMPORTANTISSIMO per non sovrascrivere i pesi del checkpoint.
     """
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint non trovato: {ckpt_path}")
 
-    # Se hai usato self.save_hyperparameters() nel modello (sì), questo funziona.
     model = AnomalySegmenter.load_from_checkpoint(
         ckpt_path,
-        map_location="cpu",  # carico CPU, poi .to(device)
+        map_location="cpu",
         strict=True,
+        pretrained_eomt_bin=None,   # ✅ BLOCCA reload .bin durante eval
     )
 
     model.to(device)
     model.eval()
     return model
+
+
+@torch.no_grad()
+def compute_anomaly_map_eomt_style(model: AnomalySegmenter, img_tensor: torch.Tensor, method: str, img_size):
+    """
+    Replica la logica del prof/EoMT:
+      - prende mask_logits + class_logits dall'ultimo layer
+      - fa upsample mask logits
+      - drop no-object se presente
+      - seg_probs = einsum(class_probs, mask_probs)
+      - anomaly map da seg_probs (MSP) oppure dagli pseudo-logits (per maxlogit/entropy)
+    """
+    # 1) forward "nativo" del decoder EoMT
+    mask_logits_layers, class_logits_layers = model.model(img_tensor)
+    mask_logits = mask_logits_layers[-1]     # (B,Q,h,w)
+    class_logits = class_logits_layers[-1]   # (B,Q,C+1) o (B,Q,C)
+
+    # 2) upsample masks alla risoluzione immagine
+    if mask_logits.shape[-2:] != img_size:
+        mask_logits = F.interpolate(mask_logits, size=img_size, mode="bilinear", align_corners=False)
+
+    # 3) drop no-object se presente
+    if class_logits.shape[-1] == NUM_CLASSES + 1:
+        class_logits = class_logits[..., :NUM_CLASSES]
+    else:
+        class_logits = class_logits[..., :NUM_CLASSES]
+
+    # 4) probabilistic composition (Mask2Former-style)
+    mask_probs = mask_logits.sigmoid()                # (B,Q,H,W)
+    class_probs = torch.softmax(class_logits, dim=-1) # (B,Q,C)
+    seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W)
+
+    # 5) anomaly map (prof-style scoring)
+    if method == "msp":
+        msp = seg_probs.max(dim=1).values     # (B,H,W)
+        anomaly = 1.0 - msp
+
+    elif method == "maxlogit":
+        # per avere qualcosa di coerente, usiamo pseudo-logits = log(seg_probs)
+        pseudo_logits = torch.log(seg_probs.clamp_min(1e-6))
+        maxlogit = pseudo_logits.max(dim=1).values
+        anomaly = -maxlogit
+
+    elif method == "maxentropy":
+        eps = 1e-8
+        p = seg_probs / (seg_probs.sum(dim=1, keepdim=True).clamp_min(eps))  # normalizza (sicurezza)
+        entropy = -(p * (p + eps).log()).sum(dim=1)  # (B,H,W)
+        anomaly = entropy
+
+    elif method == "rba":
+        msp = seg_probs.max(dim=1).values
+        accept_threshold = 0.5
+        anomaly = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
+
+    else:
+        raise ValueError(f"Metodo anomalia non supportato: {method}")
+
+    return anomaly  # (B,H,W)
 
 
 # -----------------------------------------------------------------------------
@@ -103,7 +129,6 @@ def main():
         default="/home/shyam/Mask2Former/unk-eval/RoadObsticle21/images/*.webp",
         help="Path o glob pattern immagini input",
     )
-
     parser.add_argument("--ckpt_dir", default="./checkpoints/", help="Cartella checkpoint Lightning")
     parser.add_argument("--ckpt_name", default="last.ckpt", help="Nome checkpoint (es: last.ckpt o seg-xx-xxxxxx.ckpt)")
 
@@ -141,6 +166,7 @@ def main():
     try:
         model = load_my_model(ckpt_full_path, device)
         print("✅ Modello caricato con successo.")
+        print("✅ NOTA: se vedi ancora [LOAD_EOMT_BIN] allora stai usando un file diverso o non hai salvato la modifica.\n")
     except Exception as e:
         print(f"❌ Errore critico nel caricamento del modello: {e}")
         return
@@ -158,12 +184,13 @@ def main():
         img_tensor = input_transform(img_pil).unsqueeze(0).float().to(device)
 
         with torch.no_grad():
-            # Il tuo forward ritorna già seg_logits [B,C,H,W]
-            logits_bchw = model(img_tensor).float()
-            pixel_logits = logits_bchw[0]  # [C,H,W]
-
-            anomaly_map = compute_anomaly_map(pixel_logits, args.method)
-            anomaly_np = anomaly_map.detach().cpu().numpy()
+            anomaly_map_bhw = compute_anomaly_map_eomt_style(
+                model,
+                img_tensor,
+                method=args.method,
+                img_size=IMG_SIZE,
+            )
+            anomaly_np = anomaly_map_bhw[0].detach().cpu().numpy()
 
         # --- GT path mapping ---
         pathGT = path.replace("images", "labels_masks")
@@ -183,7 +210,7 @@ def main():
         gt_img = target_transform(gt_img)
         ood_gts = np.array(gt_img)
 
-        # --- dataset-specific relabeling ---
+        # --- dataset-specific relabeling (come prof) ---
         if "RoadAnomaly" in pathGT:
             ood_gts = np.where((ood_gts == 2), 1, ood_gts)
 
@@ -197,14 +224,14 @@ def main():
             ood_gts = np.where((ood_gts < 20), 0, ood_gts)
             ood_gts = np.where((ood_gts == 255), 1, ood_gts)
 
-        # skip immagini senza OOD
+        # skip immagini senza OOD (come prof)
         if 1 not in np.unique(ood_gts):
             continue
 
         ood_gts_list.append(ood_gts)
         anomaly_score_list.append(anomaly_np)
 
-        del img_tensor, anomaly_map, pixel_logits, logits_bchw
+        del img_tensor, anomaly_map_bhw
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -217,7 +244,7 @@ def main():
     ood_gts_flat = np.array(ood_gts_list)
     anomaly_scores_flat = np.array(anomaly_score_list)
 
-    # ignora 255 se presente
+    # ignora 255
     valid_mask = (ood_gts_flat != 255)
     ood_mask = (ood_gts_flat == 1) & valid_mask
     ind_mask = (ood_gts_flat == 0) & valid_mask
