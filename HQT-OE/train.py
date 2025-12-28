@@ -277,14 +277,22 @@ def main():
     # ----------------------------
     # Callbacks / trainer
     # ----------------------------
+    #ckpt = ModelCheckpoint(
+    #    dirpath=args.ckpt_dir,
+    #    filename="seg-{epoch:02d}-{step:06d}",
+    #    save_last=True,
+    #    save_top_k=2,
+    #    monitor="val_ood/auprc_msp",
+    #    mode="max",
+    #)
+
     ckpt = ModelCheckpoint(
         dirpath=args.ckpt_dir,
-        filename="seg-{epoch:02d}-{step:06d}",
         save_last=True,
-        save_top_k=2,
-        monitor="val_city/mIoU/dataloader_idx_0",
-        mode="max",
-    )
+        save_top_k=0,
+        every_n_epochs=1,
+    )   
+
     lrmon = LearningRateMonitor(logging_interval="step")
     dbg = DebugCallback(every_n_steps=20)
 

@@ -178,11 +178,19 @@ class AnomalySegmenter(L.LightningModule):
         mask_probs = mask_logits.sigmoid()                 # (B,Q,H,W)
         class_probs = torch.softmax(class_logits, dim=-1)  # (B,Q,C)
 
-        # combine queries -> per-pixel class probabilities
+        # combine queries -> per-pixel (unnormalized) class probabilities
         seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W)
 
-        # convert to logits for CE; keep numerically stable
-        seg_logits = torch.log(seg_probs.clamp_min(1e-6))
+        # IMPORTANT: ensure a valid per-pixel distribution over classes
+        eps = 1e-6
+        denom = seg_probs.sum(dim=1, keepdim=True).clamp_min(eps)
+        seg_probs = (seg_probs / denom).clamp_min(eps)
+
+        # Convert probs -> logits for CE.
+        # Any per-pixel additive constant does not change softmax, so we center for stability.
+        seg_logits = torch.log(seg_probs)
+        seg_logits = seg_logits - seg_logits.mean(dim=1, keepdim=True)
+
         if self.clamp_logits > 0:
             seg_logits = seg_logits.clamp(-self.clamp_logits, self.clamp_logits)
 
@@ -208,6 +216,11 @@ class AnomalySegmenter(L.LightningModule):
         mask_probs = mask_logits.sigmoid()
         class_probs = torch.softmax(class_logits, dim=-1)
         seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+
+        # Normalize to a proper distribution (matches the forward() normalization)
+        eps = 1e-6
+        denom = seg_probs.sum(dim=1, keepdim=True).clamp_min(eps)
+        seg_probs = (seg_probs / denom).clamp_min(eps)
         return seg_probs
 
     # ----------------------------
