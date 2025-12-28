@@ -303,7 +303,10 @@ class AnomalySegmenter(L.LightningModule):
             return zero
 
         # dopo warmup: energy loss normale
-        loss_e, *_ , sep = self.energy_loss(logits, mask)
+        # CNP/OE masks can be {0,1} or {0,255}; force {0,1}
+        oe_mask01 = (mask > 0).to(torch.int64)
+        loss_e, *_ , sep = self.energy_loss(logits, oe_mask01)
+
         loss = self.lambda_energy * loss_e
 
         bs = img.shape[0]
@@ -351,27 +354,36 @@ class AnomalySegmenter(L.LightningModule):
             pseudo_logits = torch.log(seg_probs.clamp_min(1e-6))
             E = self.energy_map(pseudo_logits)           # (B,H,W)
 
-            in_mask = (mask == 0)
-            out_mask = (mask == 1)
+            # CNP masks can be {0,1} or {0,255}; force {0,1}
+            targets01 = (mask > 0).to(torch.int64)
 
-            msp_in = msp_score[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=img.device)
-            msp_out = msp_score[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=img.device)
-            msp_sep = msp_out - msp_in
-
-            e_in = E[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=img.device)
-            e_out = E[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=img.device)
-            e_sep = e_out - e_in
+            in_mask = (targets01 == 0)
+            out_mask = (targets01 == 1)
 
             bs = img.shape[0]
-            self.log("val_ood/msp_sep", msp_sep, prog_bar=True, on_step=False, on_epoch=True,
-                     batch_size=bs, add_dataloader_idx=False)
-            self.log("val_ood/energy_sep", e_sep, prog_bar=True, on_step=False, on_epoch=True,
-                     batch_size=bs, add_dataloader_idx=False)
 
+            # Log/update only if both classes exist -> avoids NaNs and wrong epoch means
             if in_mask.any() and out_mask.any():
-                s, t = self._sample_pixels(msp_score, mask, self.ood_val_sample_pixels)
+                msp_in = msp_score[in_mask].mean()
+                msp_out = msp_score[out_mask].mean()
+                msp_sep = msp_out - msp_in
+
+                e_in = E[in_mask].mean()
+                e_out = E[out_mask].mean()
+                e_sep = e_out - e_in
+
+                self.log("val_ood/msp_sep", msp_sep, prog_bar=True, on_step=False, on_epoch=True,
+                        batch_size=bs, add_dataloader_idx=False)
+                self.log("val_ood/energy_sep", e_sep, prog_bar=True, on_step=False, on_epoch=True,
+                        batch_size=bs, add_dataloader_idx=False)
+
+                # Update AUPRC with correct {0,1} targets
+                s, t = self._sample_pixels(msp_score, targets01, self.ood_val_sample_pixels)
                 self.val_ood_auprc_msp.update(s, t)
                 self._ood_metric_updated = True
+            else:
+                # skip (image has only background or only anomaly)
+                pass
 
     def on_validation_epoch_end(self):
         if self._ood_metric_updated:

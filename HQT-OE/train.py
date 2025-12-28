@@ -71,7 +71,7 @@ class DebugCallback(L.Callback):
         if source_i == 1 and self.seen_cnp < 1:
             self.seen_cnp += 1
             uq = torch.unique(mask).detach().cpu().tolist()
-            ap = float((mask == 1).float().mean().item() * 100.0)
+            ap = float((mask > 0).float().mean().item() * 100.0)
             print(f"[DBG first oe]   img={tuple(img.shape)} mask={tuple(mask.shape)} anom%={ap:.2f} uniq={uq}")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
