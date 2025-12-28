@@ -287,11 +287,14 @@ def main():
     #)
 
     ckpt = ModelCheckpoint(
-        dirpath=args.ckpt_dir,
-        save_last=True,
-        save_top_k=0,
-        every_n_epochs=1,
-    )   
+    dirpath=args.ckpt_dir,
+    filename="bestOOD-{epoch:02d}-{step:06d}",
+    save_last=True,
+    save_top_k=2,                 # tieni 2 best (utile se c’è rumore)
+    monitor="val_ood/auprc_msp",
+    mode="max",
+    every_n_epochs=1,
+    )  
 
     lrmon = LearningRateMonitor(logging_interval="step")
     dbg = DebugCallback(every_n_steps=20)

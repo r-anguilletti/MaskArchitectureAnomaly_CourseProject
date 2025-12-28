@@ -270,8 +270,14 @@ class AnomalySegmenter(L.LightningModule):
         img, mask, source = batch
         source = self._source_to_int(source)
 
-        # ✅ logits SEMPRE calcolati prima di qualsiasi ramo
         logits = self(img).float()
+        bs = img.shape[0]
+
+        # Log is_warmup ONCE with consistent args (no Lightning misconfiguration)
+        is_warm = float(
+            (source == 1) and getattr(self, "warmup_epochs", 0) and (self.current_epoch < self.warmup_epochs)
+        )
+        self.log("train/is_warmup", is_warm, prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
 
         # ----------------------------
         # City (ID)
@@ -283,7 +289,6 @@ class AnomalySegmenter(L.LightningModule):
             if valid.any():
                 self.train_miou(preds[valid], mask[valid])
 
-            bs = img.shape[0]
             self.log("train/loss_ce", loss_ce, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/mIoU", self.train_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
             return loss_ce
@@ -292,27 +297,18 @@ class AnomalySegmenter(L.LightningModule):
         # CNP / OE (OOD) + WARM-UP
         # ----------------------------
         if getattr(self, "warmup_epochs", 0) and self.current_epoch < self.warmup_epochs:
-            bs = img.shape[0]
-
-            # ✅ zero differenziabile (collegato al grafo)
             zero = logits.sum() * 0.0
-
             self.log("train/loss_energy", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log("train/energy_sep", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
-            self.log("train/is_warmup", 1.0, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
             return zero
 
         # dopo warmup: energy loss normale
-        # CNP/OE masks can be {0,1} or {0,255}; force {0,1}
         oe_mask01 = (mask > 0).to(torch.int64)
         loss_e, *_ , sep = self.energy_loss(logits, oe_mask01)
-
         loss = self.lambda_energy * loss_e
 
-        bs = img.shape[0]
         self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
         self.log("train/energy_sep", sep, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
-        self.log("train/is_warmup", 0.0, prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -351,8 +347,8 @@ class AnomalySegmenter(L.LightningModule):
             msp = seg_probs.max(dim=1).values            # (B,H,W)
             msp_score = 1.0 - msp                        # (B,H,W)
 
-            pseudo_logits = torch.log(seg_probs.clamp_min(1e-6))
-            E = self.energy_map(pseudo_logits)           # (B,H,W)
+            logits = self(img).float()      # logits veri (B,C,H,W)
+            E = self.energy_map(logits)     # energy coerente con training
 
             # CNP masks can be {0,1} or {0,255}; force {0,1}
             targets01 = (mask > 0).to(torch.int64)
