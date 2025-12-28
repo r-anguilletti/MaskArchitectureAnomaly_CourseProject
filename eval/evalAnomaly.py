@@ -102,19 +102,22 @@ def main():
         #images = images.permute(0,3,1,2) #Action already done by ToTensor()
         with torch.no_grad():
             result = model(images)
-        #MSP
-        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)
-        #MAX LOGIT low logit means anomaly ->  we use the -max logit as anomaly score 
-        max_logit_tensor = torch.max(result, dim=1)[0]
-        max_logit_score = -max_logit_tensor.squeeze(0).data.cpu().numpy()
-        #ENTROPY -> - sum(p*log(p))
-        # Compute log-softmax probabilities
-        softmax = torch.nn.Softmax(dim=1)  
-        prob = softmax(result)
-        log_prob = torch.log(prob + 1e-10)
-        # Compute entropy (adding a small constant to avoid log(0))
-        entropy_tensor = -torch.sum(prob * log_prob, dim=1)
-        entropy_score = entropy_tensor.squeeze(0).data.cpu().numpy()        
+            #MSP
+            logits = result.squeeze(0)
+            probs = torch.softmax(logits, dim=0)
+            msp = probs.max(dim=0).values
+            anomaly_result = 1.0 - msp
+            #MAX LOGIT low logit means anomaly ->  we use the -max logit as anomaly score 
+            max_logit_tensor = torch.max(result, dim=1)[0]
+            max_logit_score = -max_logit_tensor.squeeze(0).data.cpu().numpy()
+            #ENTROPY -> - sum(p*log(p))
+            # Compute log-softmax probabilities
+            softmax = torch.nn.Softmax(dim=1)  
+            prob = softmax(result)
+            log_prob = torch.log(prob + 1e-10)
+            # Compute entropy (adding a small constant to avoid log(0))
+            entropy_tensor = -torch.sum(prob * log_prob, dim=1)
+            entropy_score = entropy_tensor.squeeze(0).data.cpu().numpy()        
         pathGT = path.replace("images", "labels_masks")                
         if "RoadObsticle21" in pathGT:
            pathGT = pathGT.replace("webp", "png")
