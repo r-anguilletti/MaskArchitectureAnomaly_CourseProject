@@ -145,9 +145,11 @@ def compute_anomaly_map(logits: torch.Tensor, method: str) -> torch.Tensor:
 
     elif method == "rba":
         # Reject-Based Acceptance (semplificato)
-        msp = probs.max(dim=0).values
-        accept_threshold = 0.5
-        anomaly_map = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
+        #msp = probs.max(dim=0).values
+        #accept_threshold = 0.5
+        #anomaly_map = torch.clamp(accept_threshold - msp, min=0) / accept_threshold
+
+        anomaly_map = -logits.tanh().sum(dim=0)
 
     else:
         raise ValueError(f"Metodo anomalia non supportato: {method}")
