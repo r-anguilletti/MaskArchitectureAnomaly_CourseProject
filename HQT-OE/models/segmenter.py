@@ -157,7 +157,6 @@ class AnomalySegmenter(L.LightningModule):
 
     # ----------------------------
     # Forward -> per-pixel logits (B,C,H,W)
-    # IMPORTANT: probabilistic composition (Mask2Former-style)
     # ----------------------------
     def forward(self, x):
         mask_logits_layers, class_logits_layers = self.model(x)
@@ -197,7 +196,7 @@ class AnomalySegmenter(L.LightningModule):
         return seg_logits
 
     # ----------------------------
-    # EoMT-style seg_probs (for OOD metrics aligned with eval_my_model.py)
+    # EoMT-style seg_probs
     # ----------------------------
     @torch.no_grad()
     def seg_probs_eomt_style(self, x: torch.Tensor) -> torch.Tensor:
@@ -217,14 +216,14 @@ class AnomalySegmenter(L.LightningModule):
         class_probs = torch.softmax(class_logits, dim=-1)
         seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
 
-        # Normalize to a proper distribution (matches the forward() normalization)
+        # Normalize to a proper distribution
         eps = 1e-6
         denom = seg_probs.sum(dim=1, keepdim=True).clamp_min(eps)
         seg_probs = (seg_probs / denom).clamp_min(eps)
         return seg_probs
 
     # ----------------------------
-    # OOD scores (energy on pseudo-logits = log(seg_probs))
+    # OOD scores
     # ----------------------------
     def energy_map(self, logits):
         return -self.T * torch.logsumexp(logits / self.T, dim=1)  # (B,H,W)
@@ -239,7 +238,7 @@ class AnomalySegmenter(L.LightningModule):
         return s[idx], t[idx]
 
     # ----------------------------
-    # Energy loss (train) on pseudo-logits
+    # Energy loss (train)
     # ----------------------------
     def energy_loss(self, logits, oe_mask01):
         E = self.energy_map(logits)
@@ -273,7 +272,7 @@ class AnomalySegmenter(L.LightningModule):
         logits = self(img).float()
         bs = img.shape[0]
 
-        # Log is_warmup ONCE with consistent args (no Lightning misconfiguration)
+        # Warm-up indicator
         is_warm = float(
             (source == 1) and getattr(self, "warmup_epochs", 0) and (self.current_epoch < self.warmup_epochs)
         )
@@ -302,7 +301,7 @@ class AnomalySegmenter(L.LightningModule):
             self.log("train/energy_sep", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             return zero
 
-        # dopo warmup: energy loss normale
+        # after warmup: normal energy loss
         oe_mask01 = (mask > 0).to(torch.int64)
         loss_e, *_ , sep = self.energy_loss(logits, oe_mask01)
         loss = self.lambda_energy * loss_e
@@ -331,7 +330,7 @@ class AnomalySegmenter(L.LightningModule):
                 self.val_miou(preds[valid], mask[valid])
 
             bs = img.shape[0]
-            # IMPORTANT: no dataloader_idx suffixes
+            
             self.log("val_city/loss", loss, prog_bar=True, on_step=False, on_epoch=True,
                      batch_size=bs, add_dataloader_idx=False)
             self.log("val_city/mIoU", self.val_miou, prog_bar=True, on_step=False, on_epoch=True,
@@ -339,7 +338,7 @@ class AnomalySegmenter(L.LightningModule):
             return loss
 
         # ----------------------------
-        # CNP val (OOD) - PROF/EoMT STYLE (match eval_my_model.py)
+        # CNP val (OOD)
         # ----------------------------
         with torch.no_grad():
             seg_probs = self.seg_probs_eomt_style(img)   # (B,C,H,W)
@@ -347,8 +346,8 @@ class AnomalySegmenter(L.LightningModule):
             msp = seg_probs.max(dim=1).values            # (B,H,W)
             msp_score = 1.0 - msp                        # (B,H,W)
 
-            logits = self(img).float()      # logits veri (B,C,H,W)
-            E = self.energy_map(logits)     # energy coerente con training
+            logits = self(img).float()      
+            E = self.energy_map(logits)     
 
             # CNP masks can be {0,1} or {0,255}; force {0,1}
             targets01 = (mask > 0).to(torch.int64)

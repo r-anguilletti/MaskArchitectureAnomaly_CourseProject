@@ -48,7 +48,6 @@ def main():
     print(f"\n--- Eval mIoU Cityscapes | device={device} | split={args.split} | img_size={img_size} ---")
     print(f"ckpt: {args.ckpt}\n")
 
-    # Dataset identico al training
     ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split=args.split, img_size=img_size)
     dl = DataLoader(
         ds,
@@ -59,7 +58,6 @@ def main():
         drop_last=False,
     )
 
-    # IMPORTANTISSIMO: impedisci reload .bin in __init__ durante load_from_checkpoint
     model = AnomalySegmenter.load_from_checkpoint(
         args.ckpt,
         map_location="cpu",
@@ -71,10 +69,9 @@ def main():
 
     ignore_index = getattr(model, "ignore_index", 255)
 
-    # ✅ QUESTA è la mIoU "come training": update SOLO sui pixel validi
     miou_like_training = MulticlassJaccardIndex(
         num_classes=19,
-        ignore_index=ignore_index,  # ok anche se poi mascheriamo, ma lasciamolo uguale
+        ignore_index=ignore_index, 
         average="macro",
     ).to(device)
 
@@ -91,7 +88,6 @@ def main():
         img = img.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
-        # Mimica Lightning precision=16-mixed (solo inferenza)
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 out = model(img)
@@ -104,8 +100,6 @@ def main():
         valid = (mask != ignore_index)
         total_pixels_valid += int(valid.sum().item())
 
-        # ✅ identico al tuo validation_step City:
-        #    if valid.any(): self.val_miou(preds[valid], mask[valid])
         if valid.any():
             miou_like_training.update(preds[valid], mask[valid])
 

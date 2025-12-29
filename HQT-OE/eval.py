@@ -1,4 +1,3 @@
-# eval_my_model.py
 import os
 import sys
 import glob
@@ -21,7 +20,7 @@ PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from models.segmenter import AnomalySegmenter  # <-- il TUO modello
+from models.segmenter import AnomalySegmenter
 
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,16 +32,10 @@ if EOMT_ROOT not in sys.path:
 
 from training.lightning_module import LightningModule as EoMTLightningModule
 
-
-# -----------------------------------------------------------------------------
-# CONFIG
-# -----------------------------------------------------------------------------
 SEED = 42
 NUM_CLASSES = 19
 
-# -----------------------------------------------------------------------------
-# UTILS
-# -----------------------------------------------------------------------------
+
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
     idxs = np.where(tpr >= 0.95)[0]
@@ -58,7 +51,7 @@ def load_my_model(ckpt_path: str, device: torch.device) -> AnomalySegmenter:
         ckpt_path,
         map_location="cpu",
         strict=True,
-        pretrained_eomt_bin=None,   # IMPORTANTISSIMO
+        pretrained_eomt_bin=None, 
     )
     model.to(device)
     model.eval()
@@ -105,7 +98,7 @@ def compute_anomaly_map_eomt_style(
         anomaly = -(probs * (probs + eps).log()).sum(dim=0)
 
     elif method == "rba":
-        # stesso proxy usato dal prof
+        
         anomaly = -pixel_logits.tanh().sum(dim=0)
 
     else:
@@ -113,9 +106,7 @@ def compute_anomaly_map_eomt_style(
 
     return anomaly.unsqueeze(0)  # [1,H,W]
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
+
 def main():
     parser = ArgumentParser()
     parser.add_argument(
@@ -179,7 +170,6 @@ def main():
         except FileNotFoundError:
             continue
 
-        # === mapping IDENTICO al prof ===
         if "RoadAnomaly" in pathGT:
             gt = np.where(gt == 2, 1, gt)
 
@@ -193,7 +183,6 @@ def main():
             gt = np.where(gt < 20, 0, gt)
             gt = np.where(gt == 255, 1, gt)
 
-        # === SKIP IDENTICO al prof ===
         if 1 not in np.unique(gt):
             continue
 

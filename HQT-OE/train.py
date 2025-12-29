@@ -110,7 +110,7 @@ def _maybe_subset(ds, limit: int):
 def main():
     ap = argparse.ArgumentParser()
 
-    # ✅ split CNP (best practice)
+    # split CNP (best practice)
     ap.add_argument("--cnp_zip_train", type=str, required=True, help="Path to CNP train zip (80%)")
     ap.add_argument("--cnp_zip_val", type=str, default=None, help="Path to CNP val zip (20%) (optional)")
 
@@ -134,7 +134,7 @@ def main():
     ap.add_argument("--log_dir", type=str, default="./logs")
     ap.add_argument("--seed", type=int, default=0)
 
-    # ✅ limit validation images (PER DATASET)
+    # limit validation images (PER DATASET)
     ap.add_argument("--val_limit", type=int, default=500,
                     help="Limit number of validation images PER dataset (City val and CNP val)")
 
@@ -144,7 +144,7 @@ def main():
     ap.add_argument("--m_out", type=float, default=-6.0)
     ap.add_argument("--lambda_energy", type=float, default=0.1)
 
-    # ✅ NEW: warmup epochs for OE / energy loss
+    # warmup epochs for OE / energy loss
     ap.add_argument(
         "--warmup_epochs",
         type=int,
@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--ckpt_path", type=str, default=None)
 
-    # ✅ validate-only
+    # validate-only
     ap.add_argument("--eval_only", action="store_true",
                     help="Run validation only on BOTH (City val + CNP val if provided) then exit")
 
@@ -264,7 +264,7 @@ def main():
         m_in=args.m_in,
         m_out=args.m_out,
         lambda_energy=args.lambda_energy,
-        warmup_epochs=args.warmup_epochs,   # ✅ NEW
+        warmup_epochs=args.warmup_epochs,  
         backbone_name=args.backbone_name,
         num_queries=args.num_queries,
         num_blocks=args.num_blocks,
@@ -290,7 +290,7 @@ def main():
     dirpath=args.ckpt_dir,
     filename="bestOOD-{epoch:02d}-{step:06d}",
     save_last=True,
-    save_top_k=2,                 # tieni 2 best (utile se c’è rumore)
+    save_top_k=2,                 
     monitor="val_ood/auprc_msp",
     mode="max",
     every_n_epochs=1,
@@ -314,7 +314,7 @@ def main():
     )
 
     # ----------------------------
-    # ✅ Eval-only on BOTH via Lightning (progress bar per dataloader)
+    # Eval-only on BOTH via Lightning (progress bar per dataloader)
     # ----------------------------
     if args.eval_only:
         val_loaders = [dl_city_val]

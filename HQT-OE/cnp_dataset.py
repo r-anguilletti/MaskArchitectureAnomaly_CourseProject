@@ -5,18 +5,14 @@ import torch
 import numpy as np
 from PIL import Image
 
-# IMPORT DEL TUO DATASET (quello che funziona già)
 from datasets.hybrid_anomaly import HybridAnomalyDataset
 
-# -------------------
-# CONFIG
-# -------------------
 PATH_CITY = "/content/Cityscapes_Local"
 PATH_COCO = "/content/COCO_Local"
 
-IMG_SIZE = (518, 518)          # come nel tuo check_data.py
-N_SAMPLES = 10000              # quanti campioni vuoi pre-generare
-ANOMALY_CLASS_ID = 19          # come nel tuo progetto (hybrid_anomaly.py)
+IMG_SIZE = (518, 518)         
+N_SAMPLES = 10000              
+ANOMALY_CLASS_ID = 19          
 
 TMP_OUT = Path("/content/tmp_cnp_from_hybrid")
 OUT_IMG = TMP_OUT / "images"
@@ -25,10 +21,8 @@ OUT_MSK = TMP_OUT / "masks"
 ZIP_LOCAL = Path("/content/cnp_dataset.zip")
 ZIP_DRIVE = Path("/content/drive/MyDrive/Anomaly_Segmentation/cnp_dataset.zip")
 
-# zip veloce
 ZIP_COMPRESSLEVEL = 3
 
-# seed (riproducibile)
 SEED = 0
 random.seed(SEED)
 np.random.seed(SEED)
@@ -62,7 +56,7 @@ def main():
 
     # 1) init dataset
     ds = HybridAnomalyDataset(PATH_CITY, PATH_COCO, img_size=IMG_SIZE)
-    print("✅ Dataset initialized. len(ds) =", len(ds))
+    print("Dataset initialized. len(ds) =", len(ds))
 
     t0 = time.time()
     anomalies = 0
@@ -79,8 +73,6 @@ def main():
         img_vis = denormalize_imagenet(img_t).mul(255).byte().permute(1, 2, 0).cpu().numpy()
         Image.fromarray(img_vis).save(OUT_IMG / f"{i:07d}.png")
 
-        # salva maschera come PNG 8-bit:
-        # 0 = normale, 255 = anomalia (più semplice per training binario)
         m = (mask_t == ANOMALY_CLASS_ID).to(torch.uint8).mul(255).cpu().numpy()
         Image.fromarray(m).save(OUT_MSK / f"{i:07d}.png")
 
@@ -103,7 +95,7 @@ def main():
 
     ZIP_DRIVE.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ZIP_LOCAL, ZIP_DRIVE)
-    print("✅ DONE")
+    print("DONE")
     print("Saved zip to:", ZIP_DRIVE)
 
 

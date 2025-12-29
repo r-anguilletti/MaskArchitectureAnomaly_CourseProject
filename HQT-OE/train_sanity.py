@@ -37,7 +37,7 @@ def labelids_to_trainids(mask_pil: Image.Image) -> torch.Tensor:
 
 # ---------------------------
 # Cityscapes ZIP dataset
-# ritorna (img, mask_trainIds, "city")
+# return (img, mask_trainIds, "city")
 # ---------------------------
 class CityscapesZipLabelIdsToTrainIds(Dataset):
     def __init__(
@@ -94,21 +94,6 @@ class CityscapesZipLabelIdsToTrainIds(Dataset):
         return img_t, mask_t, 0
 
 class CityscapesFolderLabelIdsToTrainIds(Dataset):
-    """
-    Cityscapes da filesystem (cartelle).
-    Si aspetta una struttura tipo:
-
-    root/
-      leftImg8bit/
-        train/val/test/
-          frankfurt/...
-      gtFine/
-        train/val/test/
-          frankfurt/...
-
-    Ritorna: (img_t, mask_trainIds, "city")
-    dove mask_trainIds è in {0..18} e 255=ignore
-    """
     def __init__(self, root: str, split: str = "train", img_size=(518, 518)):
         self.root = Path(root)
         self.split = split
@@ -120,11 +105,9 @@ class CityscapesFolderLabelIdsToTrainIds(Dataset):
         assert self.left_dir.exists(), f"Non trovo {self.left_dir}"
         assert self.gt_dir.exists(),   f"Non trovo {self.gt_dir}"
 
-        # lista immagini
         self.img_names = sorted(self.left_dir.rglob("*_leftImg8bit.png"))
         assert len(self.img_names) > 0, f"Nessuna immagine trovata in {self.left_dir}"
 
-        # lista maschere corrispondenti
         self.mask_names = []
         for p in self.img_names:
             city = p.parent.name
@@ -132,7 +115,6 @@ class CityscapesFolderLabelIdsToTrainIds(Dataset):
             m = self.gt_dir / city / f"{base}_gtFine_labelIds.png"
             self.mask_names.append(m)
 
-        # sanity: verifica corrispondenza (se manca qualcosa, esplode subito)
         missing = [str(m) for m in self.mask_names if not m.exists()]
         if len(missing) > 0:
             raise FileNotFoundError(
@@ -162,7 +144,7 @@ class CityscapesFolderLabelIdsToTrainIds(Dataset):
     
 
 # ---------------------------
-# Wrapper per resize CNP
+# Wrapper resize CNP
 # ---------------------------
 class CNPResizeWrapper(Dataset):
     def __init__(self, base_ds: Dataset, img_size=(518, 518)):
@@ -180,7 +162,7 @@ class CNPResizeWrapper(Dataset):
 
 
 # ---------------------------
-# collate_fn: mantiene source come STRINGA
+# collate_fn: source = STR
 # ---------------------------
 def collate_city(batch):
     imgs = torch.stack([b[0] for b in batch], dim=0)
@@ -223,7 +205,7 @@ class MixedFiniteIterable(IterableDataset):
 
 
 # ---------------------------
-# Debug callback: print intelligenti
+# Debug callback
 # ---------------------------
 class DebugPrintCallback(L.Callback):
     def __init__(self, every_n_steps=20, first_k_per_source=2):
@@ -248,25 +230,21 @@ class DebugPrintCallback(L.Callback):
         img, mask, source = batch
         step = int(trainer.global_step)
 
-        # Print primi batch per ciascun source
         if self.seen.get(source, 0) < self.first_k:
             self.seen[source] += 1
             print(f"\n[DBG first {source}] step={step} img={tuple(img.shape)} mask={tuple(mask.shape)} "
                   f"mask_stats=({self._mask_stats(mask, source, getattr(pl_module,'ignore_index',255))})")
 
-            # Se il modello ha energy_map, stampa anche energia base (utile)
             if hasattr(pl_module, "energy_map"):
                 with torch.no_grad():
                     logits = pl_module(img)
                     E = pl_module.energy_map(logits)
                     print(f"[DBG energy] E mean={E.mean().item():.3f} min={E.min().item():.3f} max={E.max().item():.3f}")
 
-        # Print periodico
         if step > 0 and (step % self.every_n_steps == 0):
             m = trainer.callback_metrics
             keys = list(m.keys())
 
-            # valori "comuni"
             loss = m.get("train/loss_ce", m.get("train_loss", None))
             miou = m.get("train/mIoU", m.get("train_mIoU", None))
             val_miou = m.get("val/mIoU", m.get("val_mIoU", None))
@@ -281,7 +259,7 @@ class DebugPrintCallback(L.Callback):
 
             msg = f"\n[DBG step={step}] keys={keys[:12]}..."
             msg += f" | train_loss={fmt(loss)} train_mIoU={fmt(miou)} val_mIoU={fmt(val_miou)}"
-            # energia se presente nei log
+
             if "train/energy_sep" in m:
                 msg += f" | E_sep={fmt(m['train/energy_sep'])}"
             if "train/energy_in" in m:
@@ -290,7 +268,6 @@ class DebugPrintCallback(L.Callback):
                 msg += f" | E_out={fmt(m['train/energy_out'])}"
             print(msg)
 
-            # warning utile: batch cnp senza anomalie o senza background
             if source == "cnp":
                 uniq = torch.unique(mask).tolist()
                 if uniq == [0] or uniq == [1]:
@@ -382,8 +359,8 @@ def main():
         dirpath=args.ckpt_dir,
         filename="clean-{epoch:02d}-{step:06d}",
         save_last=True,
-        save_top_k=0,               # <- niente monitor => niente errori strani
-        every_n_train_steps=200,    # salva ogni tot step (cambia se vuoi)
+        save_top_k=0,               
+        every_n_train_steps=200,   
     )
 
     dbg = DebugPrintCallback(every_n_steps=args.print_every, first_k_per_source=2)

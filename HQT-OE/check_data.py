@@ -5,7 +5,6 @@ import os
 from torchvision.transforms import functional as F
 from datasets.hybrid_anomaly import HybridAnomalyDataset
 
-# --- CONFIGURA I PERCORSI ---
 PATH_CITY = "/content/Cityscapes_Local" 
 PATH_COCO = "/content/COCO_Local"
 OUTPUT_DIR = "debug_data_proof"
@@ -21,17 +20,15 @@ def denormalize(tensor):
     return tensor.clamp(0, 1)
 
 def main():
-    print(f"--- 🕵️‍♂️ DATASET INSPECTION START ---")
-    
-    # 1. Carichiamo il Dataset
+    print(f"--- DATASET INSPECTION START ---")
+
     try:
         ds = HybridAnomalyDataset(PATH_CITY, PATH_COCO, img_size=IMG_SIZE)
-        print("✅ Dataset inizializzato correttamente.")
+        print("Dataset inizializzato correttamente.")
     except Exception as e:
-        print(f"❌ Errore init dataset: {e}")
+        print(f"Errore init dataset: {e}")
         return
 
-    # 2. Iteriamo su 10 campioni casuali
     print(f"--- Generazione di 10 campioni di prova in '{OUTPUT_DIR}' ---")
     
     found_anomalies = 0
