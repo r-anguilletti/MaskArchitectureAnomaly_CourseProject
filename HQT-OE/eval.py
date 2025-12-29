@@ -223,9 +223,15 @@ def main():
     auprc = average_precision_score(all_labels, all_scores)
     fpr95 = fpr_at_95_tpr(all_scores, all_labels)
 
+    dataset = args.input[0].split("/")[-3]
+
     print("=" * 50)
-    print(f"[MYMODEL-{args.method}] AUPRC: {auprc*100:.2f}% | FPR@95TPR: {fpr95*100:.2f}%")
+    result_str = f"[HQT-OE-{args.method}-{dataset}] AUPRC: {auprc*100:.2f}% | FPR@95TPR: {fpr95*100:.2f}%"
+    print(result_str)
     print("=" * 50)
+
+    with open("results.txt", "a") as f:
+        f.write("\n" + result_str)
 
 if __name__ == "__main__":
     main()
