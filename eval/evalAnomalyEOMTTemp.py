@@ -115,24 +115,13 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
     return model
 
 
-def get_msp_score(pixel_logits: torch.Tensor, temperature: float = 1.0) -> np.ndarray:
+def get_msp_score(per_pixel_probs: torch.Tensor) -> np.ndarray:
     """
-    Calcola l'anomaly score MSP (1 - Max Softmax Prob) applicando la temperatura.
-
-    Args:
-        pixel_logits: Tensor [C, H, W] con i logits semantici per pixel.
-        temperature: valore di temperatura per il temperature scaling.
+    per_pixel_probs: Tensor [C,H,W] output di to_per_pixel_logits_semantic (NON logits).
+    MSP = 1 - max probability per pixel.
     """
-    # Scaling dei logits
-    scaled_logits = pixel_logits / temperature
-
-    # Softmax sui canali (classe) -> probabilità per pixel
-    probs = F.softmax(scaled_logits, dim=0)
-
-    # MSP = 1 - max(P(y|x))
-    max_prob, _ = torch.max(probs, dim=0)
+    max_prob = per_pixel_probs.max(dim=0).values
     anomaly_score = 1.0 - max_prob
-
     return anomaly_score.detach().cpu().numpy()
 
 
@@ -224,15 +213,15 @@ def main():
                 final_mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
             )
 
-            # Conversione in semantic logits per-pixel [B, C, H, W]
-            per_pixel_logits = LightningModule.to_per_pixel_logits_semantic(
-                final_mask_logits, final_class_logits
-            )
-            pixel_logits = per_pixel_logits[0]  # [C, H, W]
-
-            # 2. MSP per ogni temperatura
             for t in all_temps:
-                score_map = get_msp_score(pixel_logits, temperature=t)
+                scaled_class_logits = final_class_logits / t  # temperature scaling sui VERI logits
+
+                per_pixel = LightningModule.to_per_pixel_logits_semantic(
+                    final_mask_logits, scaled_class_logits
+                )
+                per_pixel = per_pixel[0]  # [C,H,W] probability-like (non normalizzata)
+
+                score_map = get_msp_score(per_pixel)
                 anomaly_scores_dict[t].append(score_map)
 
         # ---------------------------------------------------------------------
