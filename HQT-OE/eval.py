@@ -173,10 +173,10 @@ def main():
         if "RoadAnomaly" in pathGT:
             gt = np.where(gt == 2, 1, gt)
 
-        elif "LostAndFound" in pathGT:
-            gt = np.where(gt == 0, 255, gt)
-            gt = np.where(gt == 1, 0, gt)
-            gt = np.where((gt > 1) & (gt < 201), 1, gt)
+        #elif "LostAndFound" in pathGT:
+            #gt = np.where(gt == 0, 255, gt)
+            #gt = np.where(gt == 1, 0, gt)
+            #gt = np.where((gt > 1) & (gt < 201), 1, gt)
 
         elif "Streethazard" in pathGT:
             gt = np.where(gt == 14, 255, gt)
