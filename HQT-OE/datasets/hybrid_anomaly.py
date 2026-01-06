@@ -178,7 +178,7 @@ class HybridAnomalyDataset(Dataset):
     # ==================================================
 
     def __getitem__(self, idx):
-        img, target_raw = self.cityscapes_ds[idx]
+        img, target_raw, *_ = self.cityscapes_ds[idx]
 
         if not isinstance(img, Image.Image):
             img = F.to_pil_image(img)
@@ -195,7 +195,7 @@ class HybridAnomalyDataset(Dataset):
         if random.random() < 0.7:
             for _ in range(5):
                 coco_idx = random.randint(0, len(self.coco_ds) - 1)
-                anom_img, anom_target = self.coco_ds[coco_idx]
+                anom_img, anom_target, *_ = self.coco_ds[coco_idx]
 
                 if not isinstance(anom_img, Image.Image):
                     anom_img = F.to_pil_image(anom_img)

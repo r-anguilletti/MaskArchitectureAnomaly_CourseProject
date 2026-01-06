@@ -115,12 +115,14 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
     return model
 
 
-def get_msp_score(per_pixel_probs: torch.Tensor) -> np.ndarray:
+def get_msp_score(per_pixel_logits):
     """
-    per_pixel_probs: Tensor [C,H,W] output di to_per_pixel_logits_semantic (NON logits).
-    MSP = 1 - max probability per pixel.
+    Applica il softmax per ottenere una vera distribuzione di probabilità
+    prima di calcolare l'MSP.
     """
-    max_prob = per_pixel_probs.max(dim=0).values
+    # Assicurati che l'input sia trattato come logit
+    probs = torch.softmax(per_pixel_logits, dim=0) 
+    max_prob = probs.max(dim=0).values
     anomaly_score = 1.0 - max_prob
     return anomaly_score.detach().cpu().numpy()
 
@@ -157,7 +159,7 @@ def main():
     # Target per tabella: 0.5, 0.75, 1.1
     # Search values per 'best T'
     target_temps = [0.5, 0.75, 1.0, 1.1]
-    search_temps = [0.3, 1.2, 2.0, 5.0, 7.0, 10.0, 11.0]
+    search_temps = [2.0, 3.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
     all_temps = sorted(list(set(target_temps + search_temps)))
 
     # Dizionario: {T: [anomaly_map_img0, anomaly_map_img1, ...]}
@@ -273,7 +275,7 @@ def main():
             continue
 
         # Pulizia memoria
-        del img_tensor, pixel_logits
+        del img_tensor, per_pixel
         torch.cuda.empty_cache()
 
     # -------------------------------------------------------------------------
