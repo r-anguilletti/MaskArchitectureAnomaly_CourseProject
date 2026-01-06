@@ -22,11 +22,7 @@ if PROJECT_ROOT not in sys.path:
 
 from models.segmenter import AnomalySegmenter
 
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.join(CURRENT_DIR, "..")
 EOMT_ROOT = os.path.join(PROJECT_ROOT, "eomt")
-
 if EOMT_ROOT not in sys.path:
     sys.path.insert(0, EOMT_ROOT)
 
@@ -34,6 +30,10 @@ from training.lightning_module import LightningModule as EoMTLightningModule
 
 SEED = 42
 NUM_CLASSES = 19
+
+# Cityscapes trainIds (assunzione standard)
+# Veicoli: car,truck,bus,train,motorcycle,bicycle
+IGNORE_VEHICLES = {9, 13, 14, 15, 16, 17, 18}
 
 
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -43,6 +43,7 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
         return 1.0
     return float(fpr[idxs[0]])
 
+
 def load_my_model(ckpt_path: str, device: torch.device) -> AnomalySegmenter:
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint non trovato: {ckpt_path}")
@@ -51,25 +52,24 @@ def load_my_model(ckpt_path: str, device: torch.device) -> AnomalySegmenter:
         ckpt_path,
         map_location="cpu",
         strict=True,
-        pretrained_eomt_bin=None, 
+        pretrained_eomt_bin=None,
     )
     model.to(device)
     model.eval()
     return model
 
+
 @torch.no_grad()
-def compute_anomaly_map_eomt_style(
+def compute_anomaly_and_semantic_eomt_style(
     model: AnomalySegmenter,
     img_tensor: torch.Tensor,
     method: str,
     img_size
 ):
     """
-    IDENTICO al prof:
-    - forward EoMT
-    - upsample mask logits
-    - to_per_pixel_logits_semantic
-    - MSP / MaxLogit / MaxEntropy / RbA-proxy
+    Come prima, ma in più ritorna:
+    - anomaly_map [1,H,W]
+    - pred_sem    [1,H,W] (argmax semantico, trainIds 0..18)
     """
     mask_logits_layers, class_logits_layers = model.model(img_tensor)
     final_mask_logits = mask_logits_layers[-1]      # [B,Q,h,w]
@@ -87,24 +87,22 @@ def compute_anomaly_map_eomt_style(
     pixel_logits = per_pixel_logits[0]  # [C,H,W]
     probs = F.softmax(pixel_logits, dim=0)
 
+    # semantic argmax (trainIds 0..18)
+    pred_sem = probs.argmax(dim=0)  # [H,W] torch
+
     if method == "msp":
         anomaly = 1.0 - probs.max(dim=0).values
-
     elif method == "maxlogit":
         anomaly = -pixel_logits.max(dim=0).values
-
     elif method == "maxentropy":
         eps = 1e-8
         anomaly = -(probs * (probs + eps).log()).sum(dim=0)
-
     elif method == "rba":
-        
         anomaly = -pixel_logits.tanh().sum(dim=0)
-
     else:
         raise ValueError(f"Metodo anomalia non supportato: {method}")
 
-    return anomaly.unsqueeze(0)  # [1,H,W]
+    return anomaly.unsqueeze(0), pred_sem.unsqueeze(0)  # [1,H,W], [1,H,W]
 
 
 def main():
@@ -121,6 +119,11 @@ def main():
     parser.add_argument("--method", default="msp",
                         choices=["msp", "maxlogit", "maxentropy", "rba"])
     parser.add_argument("--cpu", action="store_true")
+
+    # [NEW] abilita/disabilita masking veicoli su L&F
+    parser.add_argument("--lf_ignore_vehicles", action="store_true",
+                        help="Su LostAndFound mette a IGNORE(255) i pixel predetti come veicoli.")
+
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -157,10 +160,12 @@ def main():
         img = input_transform(Image.open(path).convert("RGB"))
         img = img.unsqueeze(0).to(device)
 
-        anomaly_map = compute_anomaly_map_eomt_style(
+        # [NEW] otteniamo anche pred_sem
+        anomaly_map, pred_sem = compute_anomaly_and_semantic_eomt_style(
             model, img, args.method, IMG_SIZE
         )
-        anomaly_np = anomaly_map[0].cpu().numpy()
+        anomaly_np = anomaly_map[0].cpu().numpy()                 # [H,W]
+        pred_sem_np = pred_sem[0].cpu().numpy().astype(np.int32)  # [H,W]
 
         pathGT = path.replace("images", "labels_masks")
         pathGT = pathGT.replace("webp", "png").replace("jpg", "png")
@@ -171,14 +176,22 @@ def main():
             continue
 
         if "RoadAnomaly" in pathGT:
+            # tuo mapping originale
             gt = np.where(gt == 2, 1, gt)
 
-        #elif "LostAndFound" in pathGT:
-            #gt = np.where(gt == 0, 255, gt)
-            #gt = np.where(gt == 1, 0, gt)
-            #gt = np.where((gt > 1) & (gt < 201), 1, gt)
+        elif "LostFound" in pathGT:
+            # ✅ GT attesa: {0,1,255} (come hai visto tu)
+            # 0=ID, 1=OOD, 255=IGNORE
+            gt = gt.astype(np.uint8)
+
+            # [NEW] ignora SOLO veicoli (non road-only, non cielo, ecc.)
+            if args.lf_ignore_vehicles:
+                ignore_veh = np.isin(pred_sem_np, list(IGNORE_VEHICLES))
+                gt = gt.copy()
+                gt[ignore_veh] = 255
 
         elif "Streethazard" in pathGT:
+            # tuo mapping originale
             gt = np.where(gt == 14, 255, gt)
             gt = np.where(gt < 20, 0, gt)
             gt = np.where(gt == 255, 1, gt)
@@ -189,7 +202,7 @@ def main():
         ood_gts_list.append(gt)
         anomaly_score_list.append(anomaly_np)
 
-        del img, anomaly_map
+        del img, anomaly_map, pred_sem
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -216,11 +229,14 @@ def main():
 
     print("=" * 50)
     result_str = f"[HQT-OE-{args.method}-{dataset}] AUPRC: {auprc*100:.2f}% | FPR@95TPR: {fpr95*100:.2f}%"
+    if "Lost" in dataset or "Found" in dataset:
+        result_str += f" | lf_ignore_vehicles={args.lf_ignore_vehicles}"
     print(result_str)
     print("=" * 50)
 
     with open("results.txt", "a") as f:
         f.write("\n" + result_str)
+
 
 if __name__ == "__main__":
     main()
