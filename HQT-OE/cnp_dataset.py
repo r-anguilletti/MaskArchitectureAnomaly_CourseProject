@@ -62,10 +62,10 @@ def main():
     anomalies = 0
 
     for i in range(N_SAMPLES):
-        # scegli un indice random per variare i base sample
+        # random sample
         idx = random.randint(0, len(ds) - 1)
 
-        img_t, mask_t = ds[idx]  # <-- QUI avviene davvero il cut&paste del tuo codice
+        img_t, mask_t = ds[idx] 
 
         # img_t: [3,H,W] float tensor (normalized)
         # mask_t: [H,W] long tensor con classi, anomalia = 19

@@ -169,8 +169,7 @@ def main():
                     help="Run validation only on BOTH (City val + CNP val if provided) then exit")
 
     # ----------------------------
-    # NEW: hard-negative vehicles on Cityscapes
-    # (serve che segmenter.py supporti questi hparams)
+    # hard-negative vehicles on Cityscapes
     # ----------------------------
     ap.add_argument("--lambda_vehicle_ce", type=float, default=0.0,
                     help="Extra CE weight for vehicle pixels on Cityscapes (hard negatives). 0 disables.")
@@ -287,7 +286,7 @@ def main():
         pretrained_eomt_bin=pretrained_bin,
         use_lora=True,
 
-        # NEW: hard-negative control (segmenter.py must accept them)
+        # hard-negative control
         lambda_vehicle_ce=args.lambda_vehicle_ce,
         vehicle_train_ids=vehicle_ids,
     )

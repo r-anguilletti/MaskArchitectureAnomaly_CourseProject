@@ -75,7 +75,7 @@ class AnomalySegmenter(L.LightningModule):
 
         self.ood_val_sample_pixels = int(ood_val_sample_pixels)
 
-        # NEW
+        # HN vehicles
         self.lambda_vehicle_ce = float(lambda_vehicle_ce)
         if isinstance(vehicle_train_ids, (list, tuple)):
             self.vehicle_train_ids = [int(x) for x in vehicle_train_ids]
@@ -208,10 +208,10 @@ class AnomalySegmenter(L.LightningModule):
         return seg_logits
 
     # ----------------------------
-    # EoMT-style seg_probs
+    # seg_probs
     # ----------------------------
     @torch.no_grad()
-    def seg_probs_eomt_style(self, x: torch.Tensor) -> torch.Tensor:
+    def seg_probs(self, x: torch.Tensor) -> torch.Tensor:
         mask_logits_layers, class_logits_layers = self.model(x)
         mask_logits = mask_logits_layers[-1]
         class_logits = class_logits_layers[-1]
@@ -274,7 +274,7 @@ class AnomalySegmenter(L.LightningModule):
         return loss, loss_in, loss_out, mean_in, mean_out, sep
 
     # ----------------------------
-    # NEW: vehicle hard-negative CE on City
+    # HN vehicles hard-negative CE on City
     # ----------------------------
     def _vehicle_hard_negative_loss(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -385,7 +385,7 @@ class AnomalySegmenter(L.LightningModule):
         # CNP val (OOD)
         # ----------------------------
         with torch.no_grad():
-            seg_probs = self.seg_probs_eomt_style(img)   # (B,C,H,W)
+            seg_probs = self.seg_probs(img)   # (B,C,H,W)
 
             msp = seg_probs.max(dim=1).values            # (B,H,W)
             msp_score = 1.0 - msp                        # (B,H,W)

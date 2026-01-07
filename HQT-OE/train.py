@@ -277,14 +277,6 @@ def main():
     # ----------------------------
     # Callbacks / trainer
     # ----------------------------
-    #ckpt = ModelCheckpoint(
-    #    dirpath=args.ckpt_dir,
-    #    filename="seg-{epoch:02d}-{step:06d}",
-    #    save_last=True,
-    #    save_top_k=2,
-    #    monitor="val_ood/auprc_msp",
-    #    mode="max",
-    #)
 
     ckpt = ModelCheckpoint(
     dirpath=args.ckpt_dir,
@@ -314,7 +306,7 @@ def main():
     )
 
     # ----------------------------
-    # Eval-only on BOTH via Lightning (progress bar per dataloader)
+    # Eval-only on BOTH via Lightning
     # ----------------------------
     if args.eval_only:
         val_loaders = [dl_city_val]

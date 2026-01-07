@@ -196,10 +196,10 @@ class AnomalySegmenter(L.LightningModule):
         return seg_logits
 
     # ----------------------------
-    # EoMT-style seg_probs
+    # seg_probs
     # ----------------------------
     @torch.no_grad()
-    def seg_probs_eomt_style(self, x: torch.Tensor) -> torch.Tensor:
+    def seg_probs(self, x: torch.Tensor) -> torch.Tensor:
         mask_logits_layers, class_logits_layers = self.model(x)
         mask_logits = mask_logits_layers[-1]
         class_logits = class_logits_layers[-1]
@@ -341,7 +341,7 @@ class AnomalySegmenter(L.LightningModule):
         # CNP val (OOD)
         # ----------------------------
         with torch.no_grad():
-            seg_probs = self.seg_probs_eomt_style(img)   # (B,C,H,W)
+            seg_probs = self.seg_probs(img)   # (B,C,H,W)
 
             msp = seg_probs.max(dim=1).values            # (B,H,W)
             msp_score = 1.0 - msp                        # (B,H,W)

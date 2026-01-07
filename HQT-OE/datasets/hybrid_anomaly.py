@@ -21,11 +21,6 @@ class HybridAnomalyDataset(Dataset):
         self.img_size = img_size
         self.anomaly_class_idx = anomaly_class_idx
 
-        # --------------------------------------------------
-        # ❌ CLASSI COCO DA ESCLUDERE
-        # --------------------------------------------------
-        # 1 = person, 3 = car
-        # (aggiungi altri ID se vuoi)
         self.EXCLUDED_COCO_IDS = {1, 3}
 
         # --------------------------------------------------
@@ -78,9 +73,9 @@ class HybridAnomalyDataset(Dataset):
     def __len__(self):
         return len(self.cityscapes_ds)
 
-    # ==================================================
+    # -------------------------------------------------
     # MASK HANDLING
-    # ==================================================
+    # -------------------------------------------------
 
     def _flatten_instance_masks(self, target_raw, height, width):
         semantic = torch.full((height, width), 255, dtype=torch.long)
@@ -111,9 +106,9 @@ class HybridAnomalyDataset(Dataset):
             return self.id_map[target]
         return target
 
-    # ==================================================
+    # --------------------------------------------------
     # COCO CROP
-    # ==================================================
+    # --------------------------------------------------
 
     def _crop_object_from_coco(self, img_pil, mask):
         mask = mask.bool()
@@ -131,9 +126,9 @@ class HybridAnomalyDataset(Dataset):
 
         return F.to_pil_image(crop_img), crop_mask
 
-    # ==================================================
+    # --------------------------------------------------
     # CUT & PASTE
-    # ==================================================
+    # --------------------------------------------------
 
     def cut_paste(self, base_img_pil, base_lbl, anom_crop_pil, anom_crop_mask):
         base_img = F.pil_to_tensor(base_img_pil).float()
@@ -173,9 +168,9 @@ class HybridAnomalyDataset(Dataset):
 
         return F.to_pil_image(base_img.byte()), base_lbl
 
-    # ==================================================
+    # --------------------------------------------------
     # GETITEM
-    # ==================================================
+    # --------------------------------------------------
 
     def __getitem__(self, idx):
         img, target_raw, *_ = self.cityscapes_ds[idx]
@@ -190,7 +185,7 @@ class HybridAnomalyDataset(Dataset):
         semantic = self._smart_encode(semantic)
 
         # --------------------------------------------------
-        # INIEZIONE ANOMALIA (COCO)
+        # COCO anomaly injection
         # --------------------------------------------------
         if random.random() < 0.7:
             for _ in range(5):
@@ -211,7 +206,7 @@ class HybridAnomalyDataset(Dataset):
                 masks = anom_target["masks"]
                 labels = anom_target["labels"]
 
-                # -------- FILTRO CLASSI COCO --------
+                # -------- COCO filter --------
                 valid_idxs = [
                     i for i, lbl in enumerate(labels.tolist())
                     if lbl not in self.EXCLUDED_COCO_IDS
@@ -223,7 +218,7 @@ class HybridAnomalyDataset(Dataset):
                 chosen = random.choice(valid_idxs)
                 mask = masks[chosen]
 
-                # 🔥 FIX CRITICA: allinea mask all'immagine
+                # align mask dimension to anom_img
                 if mask.shape[-2:] != (anom_img.height, anom_img.width):
                     mask = F.resize(
                         mask.unsqueeze(0),

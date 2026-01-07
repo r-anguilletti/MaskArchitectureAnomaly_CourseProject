@@ -120,7 +120,7 @@ def main():
                         choices=["msp", "maxlogit", "maxentropy", "rba"])
     parser.add_argument("--cpu", action="store_true")
 
-    # [NEW] abilita/disabilita masking veicoli su L&F
+    # NH LostAndFound vehicles ignore option for testing before new training
     parser.add_argument("--lf_ignore_vehicles", action="store_true",
                         help="Su LostAndFound mette a IGNORE(255) i pixel predetti come veicoli.")
 
@@ -160,7 +160,6 @@ def main():
         img = input_transform(Image.open(path).convert("RGB"))
         img = img.unsqueeze(0).to(device)
 
-        # [NEW] otteniamo anche pred_sem
         anomaly_map, pred_sem = compute_anomaly_and_semantic_eomt_style(
             model, img, args.method, IMG_SIZE
         )
@@ -176,22 +175,19 @@ def main():
             continue
 
         if "RoadAnomaly" in pathGT:
-            # tuo mapping originale
             gt = np.where(gt == 2, 1, gt)
 
         elif "LostFound" in pathGT:
-            # ✅ GT attesa: {0,1,255} (come hai visto tu)
             # 0=ID, 1=OOD, 255=IGNORE
             gt = gt.astype(np.uint8)
 
-            # [NEW] ignora SOLO veicoli (non road-only, non cielo, ecc.)
+            # NH vehicles masking test before new training
             if args.lf_ignore_vehicles:
                 ignore_veh = np.isin(pred_sem_np, list(IGNORE_VEHICLES))
                 gt = gt.copy()
                 gt[ignore_veh] = 255
 
         elif "Streethazard" in pathGT:
-            # tuo mapping originale
             gt = np.where(gt == 14, 255, gt)
             gt = np.where(gt < 20, 0, gt)
             gt = np.where(gt == 255, 1, gt)
