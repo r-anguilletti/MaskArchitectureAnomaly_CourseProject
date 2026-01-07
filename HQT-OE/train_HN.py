@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, IterableDataset, Subset
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from models.segmenter import AnomalySegmenter
+from models.segmenter_HN import AnomalySegmenter
 from cnp_zip_dataset import CNPZipDataset
 from train_sanity import CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
 

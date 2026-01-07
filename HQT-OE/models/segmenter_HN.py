@@ -1,54 +1,165 @@
-# train.py
+# models/segmenter.py
 import os
-import argparse
 import torch
-from torch.utils.data import DataLoader, IterableDataset, Subset
+import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from torchmetrics.classification import MulticlassJaccardIndex, BinaryAveragePrecision
+from peft import LoraConfig, get_peft_model
 
-from models.segmenter import AnomalySegmenter
-from cnp_zip_dataset import CNPZipDataset
-from train_sanity import CNPResizeWrapper, CityscapesFolderLabelIdsToTrainIds
-
-
-def cycle(dl):
-    while True:
-        for b in dl:
-            yield b
+from models.vit import ViT
+from models.eomt import EoMT
 
 
-class MixedFiniteIterable(IterableDataset):
-    """
-    Mixa City (ID) e CNP (OE/OOD) in un pattern fisso, per un numero finito di step/epoch.
-    """
-    def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
+class AnomalySegmenter(L.LightningModule):
+    def __init__(
+        self,
+        img_size=(1024, 1024),
+        num_id_classes=19,
+        ignore_index=255,
+        lr=1e-5,
+        weight_decay=1e-3,
+        train_epochs=10,
+
+        backbone_name="vit_base_patch14_reg4_dinov2",
+        patch_size=16,
+
+        num_queries=100,
+        num_blocks=3,
+        masked_attn_enabled=True,
+
+        pretrained_eomt_bin=None,
+
+        # Energy
+        T=1.0,
+        m_in=-12.0,
+        m_out=-6.0,
+        lambda_energy=0.1,
+
+        warmup_epochs=2,
+
+        # LoRA
+        use_lora=True,
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        lora_target_modules=("qkv",),
+        modules_to_save=("class_head", "mask_head"),
+
+        clamp_logits=50.0,
+
+        # OOD validation
+        ood_val_sample_pixels=20000,
+
+        # ----------------------------
+        # NEW: hard negative vehicles on Cityscapes
+        # ----------------------------
+        lambda_vehicle_ce=0.0,
+        vehicle_train_ids=(13, 14, 15, 16, 17, 18),
+    ):
         super().__init__()
-        self.city = cycle(dl_city) if dl_city is not None else None
-        self.cnp = cycle(dl_cnp)
-        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # 0=city, 1=cnp
-        self.steps_per_epoch = int(steps_per_epoch)
+        self.save_hyperparameters()
 
-    def __iter__(self):
-        n = 0
-        while n < self.steps_per_epoch:
-            for p in self.pattern:
-                if n >= self.steps_per_epoch:
-                    break
-                if p == 0:
-                    yield next(self.city) if self.city is not None else next(self.cnp)
-                else:
-                    yield next(self.cnp)
-                n += 1
+        self.num_id_classes = int(num_id_classes)
+        self.ignore_index = int(ignore_index)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.train_epochs = int(train_epochs)
+        self.warmup_epochs = int(warmup_epochs)
 
+        self.T = float(T)
+        self.m_in = float(m_in)
+        self.m_out = float(m_out)
+        self.lambda_energy = float(lambda_energy)
+        self.clamp_logits = float(clamp_logits)
 
-class DebugCallback(L.Callback):
-    def __init__(self, every_n_steps=20):
-        self.every_n_steps = every_n_steps
-        self.seen_city = 0
-        self.seen_cnp = 0
+        self.ood_val_sample_pixels = int(ood_val_sample_pixels)
 
-    @staticmethod
-    def _source_to_int(source):
+        # NEW
+        self.lambda_vehicle_ce = float(lambda_vehicle_ce)
+        if isinstance(vehicle_train_ids, (list, tuple)):
+            self.vehicle_train_ids = [int(x) for x in vehicle_train_ids]
+        else:
+            self.vehicle_train_ids = [int(vehicle_train_ids)]
+
+        self.encoder = ViT(
+            img_size=img_size,
+            backbone_name=backbone_name,
+            patch_size=int(patch_size),
+            ckpt_path="disable_timm_pretrained",
+        )
+
+        self.base_model = EoMT(
+            encoder=self.encoder,
+            num_classes=self.num_id_classes,
+            num_q=int(num_queries),
+            num_blocks=int(num_blocks),
+            masked_attn_enabled=bool(masked_attn_enabled),
+        )
+
+        if pretrained_eomt_bin is not None:
+            self._load_eomt_bin(pretrained_eomt_bin)
+
+        if use_lora:
+            self._setup_lora(
+                r=lora_r,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+                target_modules=list(lora_target_modules),
+                modules_to_save=list(modules_to_save),
+            )
+        else:
+            self.model = self.base_model
+
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+
+        self.train_miou = MulticlassJaccardIndex(
+            num_classes=self.num_id_classes,
+            ignore_index=self.ignore_index,
+            average="macro",
+        )
+        self.val_miou = MulticlassJaccardIndex(
+            num_classes=self.num_id_classes,
+            ignore_index=self.ignore_index,
+            average="macro",
+        )
+
+        # OOD metric (AUPRC su MSP anomaly)
+        self.val_ood_auprc_msp = BinaryAveragePrecision()
+        self._ood_metric_updated = False
+
+    # ----------------------------
+    # Loading / LoRA
+    # ----------------------------
+    def _load_eomt_bin(self, bin_path: str):
+        if not os.path.exists(bin_path):
+            raise FileNotFoundError(f"[LOAD_EOMT_BIN] not found: {bin_path}")
+
+        sd = torch.load(bin_path, map_location="cpu")
+        if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+            sd = sd["state_dict"]
+        if not isinstance(sd, dict):
+            raise ValueError("[LOAD_EOMT_BIN] Expected a state_dict-like dict.")
+
+        sd = {k: v for k, v in sd.items() if k.startswith("network.")}
+        sd = {k.replace("network.", "", 1): v for k, v in sd.items()}
+
+        missing, unexpected = self.base_model.load_state_dict(sd, strict=False)
+        print(f"[LOAD_EOMT_BIN] loaded from: {bin_path}")
+        print(f"[LOAD_EOMT_BIN] missing={len(missing)} unexpected={len(unexpected)}")
+
+    def _setup_lora(self, r, alpha, dropout, target_modules, modules_to_save):
+        peft_config = LoraConfig(
+            r=int(r),
+            lora_alpha=int(alpha),
+            lora_dropout=float(dropout),
+            target_modules=target_modules,
+            bias="none",
+            modules_to_save=modules_to_save,
+        )
+        self.model = get_peft_model(self.base_model, peft_config)
+
+    def _source_to_int(self, source):
         if isinstance(source, (list, tuple)):
             source = source[0]
         if torch.is_tensor(source):
@@ -57,300 +168,276 @@ class DebugCallback(L.Callback):
             return 0 if source == "city" else 1
         return int(source)
 
-    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        img, mask, source = batch
-        source_i = self._source_to_int(source)
-
-        if source_i == 0 and self.seen_city < 1:
-            self.seen_city += 1
-            valid = (mask != pl_module.ignore_index)
-            vp = float(valid.float().mean().item() * 100.0)
-            uq = torch.unique(mask[valid]).detach().cpu().tolist() if valid.any() else []
-            print(f"[DBG first city] img={tuple(img.shape)} mask={tuple(mask.shape)} valid%={vp:.2f} uniq(sample)={uq[:15]}")
-
-        if source_i == 1 and self.seen_cnp < 1:
-            self.seen_cnp += 1
-            uq = torch.unique(mask).detach().cpu().tolist()
-            ap = float((mask > 0).float().mean().item() * 100.0)
-            print(f"[DBG first oe]   img={tuple(img.shape)} mask={tuple(mask.shape)} anom%={ap:.2f} uniq={uq}")
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.global_step and trainer.global_step % self.every_n_steps == 0:
-            m = trainer.callback_metrics
-
-            def fmt(x):
-                if x is None:
-                    return "NA"
-                try:
-                    return f"{float(x):.4f}"
-                except Exception:
-                    return "NA"
-
-            print(
-                f"[DBG step={trainer.global_step}] "
-                f"loss_ce={fmt(m.get('train/loss_ce'))} "
-                f"loss_en={fmt(m.get('train/loss_energy'))} "
-                f"train_mIoU={fmt(m.get('train/mIoU'))} "
-                f"val_mIoU={fmt(m.get('val_city/mIoU'))} "
-                f"E_sep={fmt(m.get('train/energy_sep'))}"
-            )
-
-
-def _maybe_subset(ds, limit: int):
-    if limit is None or limit <= 0:
-        return ds
-    try:
-        n = len(ds)
-        k = min(int(limit), int(n))
-        return Subset(ds, list(range(k)))
-    except Exception:
-        return ds
-
-
-def main():
-    ap = argparse.ArgumentParser()
-
-    # split CNP (best practice)
-    ap.add_argument("--cnp_zip_train", type=str, required=True, help="Path to CNP train zip (80%)")
-    ap.add_argument("--cnp_zip_val", type=str, default=None, help="Path to CNP val zip (20%) (optional)")
-
-    ap.add_argument("--city_root", type=str, required=True)
-
-    ap.add_argument("--img_h", type=int, default=1024)
-    ap.add_argument("--img_w", type=int, default=1024)
-
-    ap.add_argument("--batch_city", type=int, default=1)
-    ap.add_argument("--batch_cnp", type=int, default=1)
-    ap.add_argument("--mix_city", type=int, default=3)
-    ap.add_argument("--mix_cnp", type=int, default=1)
-
-    ap.add_argument("--steps_per_epoch", type=int, default=200)
-    ap.add_argument("--max_epochs", type=int, default=3)
-
-    ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument("--num_workers", type=int, default=0)
-
-    ap.add_argument("--ckpt_dir", type=str, default="./checkpoints")
-    ap.add_argument("--log_dir", type=str, default="./logs")
-    ap.add_argument("--seed", type=int, default=0)
-
-    # limit validation images (PER DATASET)
-    ap.add_argument("--val_limit", type=int, default=500,
-                    help="Limit number of validation images PER dataset (City val and CNP val)")
-
-    # energy
-    ap.add_argument("--T", type=float, default=1.0)
-    ap.add_argument("--m_in", type=float, default=-12.0)
-    ap.add_argument("--m_out", type=float, default=-6.0)
-    ap.add_argument("--lambda_energy", type=float, default=0.1)
-
-    # warmup epochs for OE / energy loss
-    ap.add_argument(
-        "--warmup_epochs",
-        type=int,
-        default=0,
-        help="Number of initial epochs where OE/energy loss is disabled (warmup on City only).",
-    )
-
-    # init weights from EoMT .bin
-    ap.add_argument("--init_from_eomt_bin", type=str, default=None)
-
-    # backbone config (must match .bin)
-    ap.add_argument("--backbone_name", type=str, default="vit_base_patch14_reg4_dinov2")
-    ap.add_argument("--num_blocks", type=int, default=3)
-    ap.add_argument("--num_queries", type=int, default=100)
-
-    # resume lightning
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--ckpt_path", type=str, default=None)
-
-    # validate-only
-    ap.add_argument("--eval_only", action="store_true",
-                    help="Run validation only on BOTH (City val + CNP val if provided) then exit")
-
     # ----------------------------
-    # NEW: hard-negative vehicles on Cityscapes
-    # (serve che segmenter.py supporti questi hparams)
+    # Forward -> per-pixel logits (B,C,H,W)
     # ----------------------------
-    ap.add_argument("--lambda_vehicle_ce", type=float, default=0.0,
-                    help="Extra CE weight for vehicle pixels on Cityscapes (hard negatives). 0 disables.")
-    ap.add_argument("--vehicle_train_ids", type=str, default="13,14,15,16,17,18",
-                    help="Comma-separated Cityscapes trainIds considered as vehicles (default: 13..18)")
+    def forward(self, x):
+        mask_logits_layers, class_logits_layers = self.model(x)
+        mask_logits = mask_logits_layers[-1]     # (B,Q,h,w)
+        class_logits = class_logits_layers[-1]   # (B,Q,C+1) or (B,Q,C)
 
-    args = ap.parse_args()
+        # upsample masks to image resolution
+        if mask_logits.shape[-2:] != x.shape[-2:]:
+            mask_logits = F.interpolate(mask_logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
-    L.seed_everything(args.seed, workers=True)
-    img_size = (args.img_h, args.img_w)
-
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-
-    # parse vehicle ids
-    vehicle_ids = []
-    if args.vehicle_train_ids.strip():
-        vehicle_ids = [int(x) for x in args.vehicle_train_ids.split(",") if x.strip() != ""]
-
-    # ----------------------------
-    # Datasets / loaders
-    # ----------------------------
-    # CNP train (OE)
-    cnp_train_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_train), img_size=img_size)
-    dl_cnp_train = DataLoader(
-        cnp_train_ds,
-        batch_size=args.batch_cnp,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
-    )
-
-    # CNP val (OOD)
-    dl_cnp_val = None
-    if args.cnp_zip_val is not None:
-        cnp_val_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_val), img_size=img_size)
-        cnp_val_ds = _maybe_subset(cnp_val_ds, args.val_limit)
-        dl_cnp_val = DataLoader(
-            cnp_val_ds,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False,
-        )
-
-    # City train
-    city_train_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
-    dl_city = DataLoader(
-        city_train_ds,
-        batch_size=args.batch_city,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
-    )
-
-    # City val
-    city_val_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
-    city_val_ds = _maybe_subset(city_val_ds, args.val_limit)
-    dl_city_val = DataLoader(
-        city_val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    # Mixed finite iterator for training
-    mixed_iter = MixedFiniteIterable(
-        dl_city=dl_city,
-        dl_cnp=dl_cnp_train,
-        mix_city=args.mix_city,
-        mix_cnp=args.mix_cnp,
-        steps_per_epoch=args.steps_per_epoch,
-    )
-    dl_train = DataLoader(mixed_iter, batch_size=None, num_workers=0)
-
-    # ----------------------------
-    # Resume logic
-    # ----------------------------
-    resume_ckpt = None
-    if args.ckpt_path is not None:
-        resume_ckpt = args.ckpt_path
-        print(f"[RESUME] Using explicit ckpt: {resume_ckpt}")
-    elif args.resume:
-        last_path = os.path.join(args.ckpt_dir, "last.ckpt")
-        if os.path.exists(last_path):
-            resume_ckpt = last_path
-            print(f"[RESUME] Resuming from: {resume_ckpt}")
+        # drop "no-object" if present
+        if class_logits.shape[-1] == self.num_id_classes + 1:
+            class_logits = class_logits[..., : self.num_id_classes]
         else:
-            print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
+            class_logits = class_logits[..., : self.num_id_classes]
 
-    # If resuming from Lightning ckpt, don't re-init from bin
-    pretrained_bin = None if resume_ckpt is not None else args.init_from_eomt_bin
+        # probabilities
+        mask_probs = mask_logits.sigmoid()                 # (B,Q,H,W)
+        class_probs = torch.softmax(class_logits, dim=-1)  # (B,Q,C)
 
-    # ----------------------------
-    # Model
-    # ----------------------------
-    model = AnomalySegmenter(
-        img_size=img_size,
-        lr=args.lr,
-        T=args.T,
-        m_in=args.m_in,
-        m_out=args.m_out,
-        lambda_energy=args.lambda_energy,
-        warmup_epochs=args.warmup_epochs,
-        backbone_name=args.backbone_name,
-        num_queries=args.num_queries,
-        num_blocks=args.num_blocks,
-        patch_size=16,
-        train_epochs=args.max_epochs,
-        pretrained_eomt_bin=pretrained_bin,
-        use_lora=True,
+        # combine queries -> per-pixel (unnormalized) class probabilities
+        seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)  # (B,C,H,W)
 
-        # NEW: hard-negative control (segmenter.py must accept them)
-        lambda_vehicle_ce=args.lambda_vehicle_ce,
-        vehicle_train_ids=vehicle_ids,
-    )
+        # IMPORTANT: ensure a valid per-pixel distribution over classes
+        eps = 1e-6
+        denom = seg_probs.sum(dim=1, keepdim=True).clamp_min(eps)
+        seg_probs = (seg_probs / denom).clamp_min(eps)
+
+        # Convert probs -> logits for CE.
+        seg_logits = torch.log(seg_probs)
+        seg_logits = seg_logits - seg_logits.mean(dim=1, keepdim=True)
+
+        if self.clamp_logits > 0:
+            seg_logits = seg_logits.clamp(-self.clamp_logits, self.clamp_logits)
+
+        return seg_logits
 
     # ----------------------------
-    # Callbacks / trainer
+    # EoMT-style seg_probs
     # ----------------------------
-    ckpt = ModelCheckpoint(
-        dirpath=args.ckpt_dir,
-        filename="bestOOD-{epoch:02d}-{step:06d}",
-        save_last=True,
-        save_top_k=2,
-        monitor="val_ood/auprc_msp",
-        mode="max",
-        every_n_epochs=1,
-    )
+    @torch.no_grad()
+    def seg_probs_eomt_style(self, x: torch.Tensor) -> torch.Tensor:
+        mask_logits_layers, class_logits_layers = self.model(x)
+        mask_logits = mask_logits_layers[-1]
+        class_logits = class_logits_layers[-1]
 
-    lrmon = LearningRateMonitor(logging_interval="step")
-    dbg = DebugCallback(every_n_steps=20)
+        if mask_logits.shape[-2:] != x.shape[-2:]:
+            mask_logits = F.interpolate(mask_logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
-    trainer = L.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        precision="16-mixed" if torch.cuda.is_available() else "32-true",
-        max_epochs=args.max_epochs,
-        callbacks=[ckpt, lrmon, dbg],
-        default_root_dir=args.log_dir,
-        log_every_n_steps=10,
-        gradient_clip_val=0.5,
-        gradient_clip_algorithm="norm",
-        check_val_every_n_epoch=1,
-        num_sanity_val_steps=2,
-    )
+        if class_logits.shape[-1] == self.num_id_classes + 1:
+            class_logits = class_logits[..., : self.num_id_classes]
+        else:
+            class_logits = class_logits[..., : self.num_id_classes]
+
+        mask_probs = mask_logits.sigmoid()
+        class_probs = torch.softmax(class_logits, dim=-1)
+        seg_probs = torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+
+        eps = 1e-6
+        denom = seg_probs.sum(dim=1, keepdim=True).clamp_min(eps)
+        seg_probs = (seg_probs / denom).clamp_min(eps)
+        return seg_probs
 
     # ----------------------------
-    # Eval-only on BOTH via Lightning
+    # OOD scores
     # ----------------------------
-    if args.eval_only:
-        val_loaders = [dl_city_val]
-        if dl_cnp_val is not None:
-            val_loaders.append(dl_cnp_val)
+    def energy_map(self, logits):
+        return -self.T * torch.logsumexp(logits / self.T, dim=1)  # (B,H,W)
 
-        print("\n[INFO] Running validation ONLY on BOTH (City val + CNP val)...\n")
-        results = trainer.validate(
-            model,
-            dataloaders=val_loaders,
-            ckpt_path=resume_ckpt,
-            verbose=True,
+    def _sample_pixels(self, scores, targets01, max_pixels):
+        s = scores.reshape(-1)
+        t = targets01.reshape(-1).to(torch.int64)
+        n = s.numel()
+        if n <= max_pixels:
+            return s, t
+        idx = torch.randperm(n, device=s.device)[:max_pixels]
+        return s[idx], t[idx]
+
+    # ----------------------------
+    # Energy loss (train)
+    # ----------------------------
+    def energy_loss(self, logits, oe_mask01):
+        E = self.energy_map(logits)
+        in_mask = (oe_mask01 == 0)
+        out_mask = (oe_mask01 == 1)
+
+        loss_in = torch.tensor(0.0, device=logits.device)
+        loss_out = torch.tensor(0.0, device=logits.device)
+
+        if in_mask.any():
+            loss_in = torch.mean(F.relu(E[in_mask] - self.m_in) ** 2)
+        if out_mask.any():
+            loss_out = torch.mean(F.relu(self.m_out - E[out_mask]) ** 2)
+
+        loss = loss_in + loss_out
+
+        with torch.no_grad():
+            mean_in = E[in_mask].mean() if in_mask.any() else torch.tensor(float("nan"), device=logits.device)
+            mean_out = E[out_mask].mean() if out_mask.any() else torch.tensor(float("nan"), device=logits.device)
+            sep = mean_out - mean_in
+
+        return loss, loss_in, loss_out, mean_in, mean_out, sep
+
+    # ----------------------------
+    # NEW: vehicle hard-negative CE on City
+    # ----------------------------
+    def _vehicle_hard_negative_loss(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Extra CE loss that upweights pixels belonging to vehicle classes in Cityscapes.
+        - logits: (B,C,H,W)
+        - mask:   (B,H,W) trainId in [0..18] or 255
+        """
+        if self.lambda_vehicle_ce <= 0.0:
+            return logits.sum() * 0.0
+
+        valid = (mask != self.ignore_index)
+        if not valid.any():
+            return logits.sum() * 0.0
+
+        veh = torch.zeros_like(mask, dtype=torch.bool)
+        for tid in self.vehicle_train_ids:
+            veh |= (mask == tid)
+
+        # if there are no vehicle pixels, return 0 (keep stable)
+        if not veh.any():
+            return logits.sum() * 0.0
+
+        # per-pixel CE (no reduction) then average only on vehicle pixels
+        ce_per_px = F.cross_entropy(logits, mask, ignore_index=self.ignore_index, reduction="none")  # (B,H,W)
+        loss_vehicle = ce_per_px[veh].mean()
+        return loss_vehicle
+
+    # ----------------------------
+    # Lightning steps
+    # ----------------------------
+    def training_step(self, batch, batch_idx):
+        img, mask, source = batch
+        source = self._source_to_int(source)
+
+        logits = self(img).float()
+        bs = img.shape[0]
+
+        is_warm = float(
+            (source == 1) and getattr(self, "warmup_epochs", 0) and (self.current_epoch < self.warmup_epochs)
         )
+        self.log("train/is_warmup", is_warm, prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
 
-        print("\n[INFO] Validate returned:")
-        print(results)
-        return
+        # ----------------------------
+        # City (ID)
+        # ----------------------------
+        if source == 0:
+            loss_ce = self.ce_loss(logits, mask)
 
-    # ----------------------------
-    # Fit (train + validate on BOTH each epoch)
-    # ----------------------------
-    val_loaders = [dl_city_val]
-    if dl_cnp_val is not None:
-        val_loaders.append(dl_cnp_val)
+            # NEW: vehicle hard-negative
+            loss_vehicle = self._vehicle_hard_negative_loss(logits, mask)
+            loss = loss_ce + (self.lambda_vehicle_ce * loss_vehicle)
 
-    trainer.fit(model, train_dataloaders=dl_train, val_dataloaders=val_loaders, ckpt_path=resume_ckpt)
+            preds = torch.argmax(logits, dim=1)
+            valid = (mask != self.ignore_index)
+            if valid.any():
+                self.train_miou(preds[valid], mask[valid])
 
+            self.log("train/loss_ce", loss_ce, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/loss_vehicle_ce", loss_vehicle, prog_bar=False, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/lambda_vehicle_ce", float(self.lambda_vehicle_ce), prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
+            self.log("train/mIoU", self.train_miou, prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+            return loss
 
-if __name__ == "__main__":
-    main()
+        # ----------------------------
+        # CNP / OE (OOD) + WARM-UP
+        # ----------------------------
+        if getattr(self, "warmup_epochs", 0) and self.current_epoch < self.warmup_epochs:
+            zero = logits.sum() * 0.0
+            self.log("train/loss_energy", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log("train/energy_sep", zero, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            return zero
+
+        oe_mask01 = (mask > 0).to(torch.int64)
+        loss_e, *_ , sep = self.energy_loss(logits, oe_mask01)
+        loss = self.lambda_energy * loss_e
+
+        self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        self.log("train/energy_sep", sep, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        return loss
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        dataloader_idx=0 -> Cityscapes val
+        dataloader_idx=1 -> CNP val (OOD mask 0/1)
+        """
+        img, mask, source = batch
+
+        # ----------------------------
+        # Cityscapes val
+        # ----------------------------
+        if dataloader_idx == 0:
+            logits = self(img).float()
+            loss = self.ce_loss(logits, mask)
+
+            preds = torch.argmax(logits, dim=1)
+            valid = (mask != self.ignore_index)
+            if valid.any():
+                self.val_miou(preds[valid], mask[valid])
+
+            bs = img.shape[0]
+            self.log("val_city/loss", loss, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
+            self.log("val_city/mIoU", self.val_miou, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=bs, add_dataloader_idx=False)
+            return loss
+
+        # ----------------------------
+        # CNP val (OOD)
+        # ----------------------------
+        with torch.no_grad():
+            seg_probs = self.seg_probs_eomt_style(img)   # (B,C,H,W)
+
+            msp = seg_probs.max(dim=1).values            # (B,H,W)
+            msp_score = 1.0 - msp                        # (B,H,W)
+
+            logits = self(img).float()
+            E = self.energy_map(logits)
+
+            targets01 = (mask > 0).to(torch.int64)
+
+            in_mask = (targets01 == 0)
+            out_mask = (targets01 == 1)
+
+            bs = img.shape[0]
+
+            if in_mask.any() and out_mask.any():
+                msp_in = msp_score[in_mask].mean()
+                msp_out = msp_score[out_mask].mean()
+                msp_sep = msp_out - msp_in
+
+                e_in = E[in_mask].mean()
+                e_out = E[out_mask].mean()
+                e_sep = e_out - e_in
+
+                self.log("val_ood/msp_sep", msp_sep, prog_bar=True, on_step=False, on_epoch=True,
+                        batch_size=bs, add_dataloader_idx=False)
+                self.log("val_ood/energy_sep", e_sep, prog_bar=True, on_step=False, on_epoch=True,
+                        batch_size=bs, add_dataloader_idx=False)
+
+                s, t = self._sample_pixels(msp_score, targets01, self.ood_val_sample_pixels)
+                self.val_ood_auprc_msp.update(s, t)
+                self._ood_metric_updated = True
+
+    def on_validation_epoch_end(self):
+        if self._ood_metric_updated:
+            auprc = self.val_ood_auprc_msp.compute()
+            self.log("val_ood/auprc_msp", auprc, prog_bar=True, on_step=False, on_epoch=True,
+                     add_dataloader_idx=False)
+
+        self.val_ood_auprc_msp.reset()
+        self._ood_metric_updated = False
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.train_epochs, eta_min=1e-6)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "epoch"}}
+
+    @torch.no_grad()
+    def anomaly_score(self, x):
+        logits = self(x).float()
+        E = self.energy_map(logits)
+        return logits, E
