@@ -54,7 +54,7 @@ def main():
     OUT_IMG.mkdir(parents=True, exist_ok=True)
     OUT_MSK.mkdir(parents=True, exist_ok=True)
 
-    # 1) init dataset
+    # Dataset
     ds = HybridAnomalyDataset(PATH_CITY, PATH_COCO, img_size=IMG_SIZE)
     print("Dataset initialized. len(ds) =", len(ds))
 
@@ -68,8 +68,8 @@ def main():
         img_t, mask_t = ds[idx] 
 
         # img_t: [3,H,W] float tensor (normalized)
-        # mask_t: [H,W] long tensor con classi, anomalia = 19
-        # salva immagine visibile (denorm -> uint8)
+        # mask_t: [H,W] long tensor with classes, anomaly = 19
+        # saves visible image (denorm -> uint8)
         img_vis = denormalize_imagenet(img_t).mul(255).byte().permute(1, 2, 0).cpu().numpy()
         Image.fromarray(img_vis).save(OUT_IMG / f"{i:07d}.png")
 
@@ -83,7 +83,7 @@ def main():
             elapsed = (time.time() - t0) / 60
             print(f"[{i+1}/{N_SAMPLES}] anomalies_in_samples={anomalies}  ({100*anomalies/(i+1):.1f}%)  elapsed={elapsed:.1f} min")
 
-    # 2) zip
+    # zip
     if ZIP_LOCAL.exists():
         ZIP_LOCAL.unlink()
 

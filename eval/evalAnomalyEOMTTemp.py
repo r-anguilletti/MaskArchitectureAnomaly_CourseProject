@@ -26,23 +26,22 @@ from models.eomt import EoMT
 from training.lightning_module import LightningModule
 
 # -----------------------------------------------------------------------------
-# CONFIGURAZIONE & PARAMETRI
+# CONFIGURATION AND PARAMETERS
 # -----------------------------------------------------------------------------
 SEED = 42
-NUM_CLASSES = 19              # Classi Cityscapes (senza void)
-IMG_SIZE = (1024, 1024)       # Coerente con lo script evalAnomalyEOMT.py
+NUM_CLASSES = 19              # Cityscapes Classes
+IMG_SIZE = (1024, 1024)       
 NUM_QUERIES = 100
 NUM_BLOCKS = 3
 BACKBONE_NAME = "vit_base_patch14_reg4_dinov2"
 
-# Setup riproducibilità
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
 
-# Trasformazioni Input/Target
+# Transformations Input/Target
 input_transform = Compose([
     Resize(IMG_SIZE, Image.BILINEAR),
     ToTensor(),
@@ -53,7 +52,7 @@ target_transform = Compose([
 ])
 
 # -----------------------------------------------------------------------------
-# FUNZIONI DI UTILITÀ
+# FUNCTIONS
 # -----------------------------------------------------------------------------
 def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
     """
@@ -67,7 +66,7 @@ def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
 
     idxs = np.where(tpr >= 0.95)[0]
     if len(idxs) == 0:
-        return 1.0  # fallback pessimistico
+        return 1.0  # pessimistic fallback
 
     return float(fpr[idxs[0]])
 
@@ -89,7 +88,7 @@ def load_eomt_model(ckpt_path: str, device: torch.device) -> EoMT:
         masked_attn_enabled=True,
     )
 
-    # LightningModule si occupa del caricamento pesi
+    # Weights Loading
     lm = LightningModule(
         network=network,
         img_size=IMG_SIZE,
@@ -120,7 +119,7 @@ def get_msp_score(per_pixel_logits):
     Applica il softmax per ottenere una vera distribuzione di probabilità
     prima di calcolare l'MSP.
     """
-    # Assicurati che l'input sia trattato come logit
+
     probs = torch.softmax(per_pixel_logits, dim=0) 
     max_prob = probs.max(dim=0).values
     anomaly_score = 1.0 - max_prob
@@ -155,25 +154,23 @@ def main():
     )
     args = parser.parse_args()
 
-    # Temperature da testare
-    # Target per tabella: 0.5, 0.75, 1.1
-    # Search values per 'best T'
+    # Temperatures to evaluate
+    # Target Temperatures: 0.5, 0.75, 1.1
     target_temps = [0.5, 0.75, 1.0, 1.1]
     search_temps = [2.0, 3.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
     all_temps = sorted(list(set(target_temps + search_temps)))
 
-    # Dizionario: {T: [anomaly_map_img0, anomaly_map_img1, ...]}
     anomaly_scores_dict = {t: [] for t in all_temps}
     ood_gts_list = []
 
-    # Configurazione device
+    # Device setup
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     print(f"Device in uso: {device}")
 
     ckpt_full_path = os.path.join(args.loadDir, args.loadWeights)
     print(f"Caricamento pesi da: {ckpt_full_path}")
 
-    # Caricamento modello EoMT
+    # EoMT Model Loading
     try:
         model = load_eomt_model(ckpt_full_path, device)
         print("Modello EoMT caricato con successo.")
@@ -181,7 +178,7 @@ def main():
         print(f"Errore critico nel caricamento del modello: {e}")
         return
 
-    # Costruzione file list
+    # File List Construction
     image_paths = []
     for pattern in args.input:
         image_paths.extend(glob.glob(os.path.expanduser(pattern)))
@@ -189,12 +186,12 @@ def main():
     print(f"Processo {len(image_paths)} immagini con temperature: {all_temps}")
 
     # -------------------------------------------------------------------------
-    # INFERENZA
+    # INFERENCE LOOP
     # -------------------------------------------------------------------------
     for path in image_paths:
         print(f"Processing: {path}")
 
-        # 1. Input image
+        # Input Image
         try:
             img_pil = Image.open(path).convert("RGB")
         except Exception as e:
@@ -210,18 +207,18 @@ def main():
             final_mask_logits = mask_logits_layers[-1]    # [B, Q, h, w]
             final_class_logits = class_logits_layers[-1]  # [B, Q, C+1]
 
-            # Upsample dei mask logits alla dimensione IMG_SIZE
+            # Upsample of mask logits to IMG_SIZE dimensions
             final_mask_logits = F.interpolate(
                 final_mask_logits, size=IMG_SIZE, mode="bilinear", align_corners=False
             )
 
             for t in all_temps:
-                scaled_class_logits = final_class_logits / t  # temperature scaling sui VERI logits
+                scaled_class_logits = final_class_logits / t  # temperature scaling
 
                 per_pixel = LightningModule.to_per_pixel_logits_semantic(
                     final_mask_logits, scaled_class_logits
                 )
-                per_pixel = per_pixel[0]  # [C,H,W] probability-like (non normalizzata)
+                per_pixel = per_pixel[0]  # [C,H,W] probability-like (not normalized)
 
                 score_map = get_msp_score(per_pixel)
                 anomaly_scores_dict[t].append(score_map)
@@ -256,8 +253,8 @@ def main():
                 ood_gts = np.where((ood_gts < 20), 0, ood_gts)
                 ood_gts = np.where((ood_gts == 255), 1, ood_gts)
 
-            # Se non ci sono pixel OOD validi in questa immagine,
-            # rimuoviamo gli anomaly score appena aggiunti
+            # If there are no valid OOD pixels in this image,
+            # remove the just added anomaly scores
             if 1 not in np.unique(ood_gts):
                 for t in all_temps:
                     if len(anomaly_scores_dict[t]) > len(ood_gts_list):
@@ -268,18 +265,18 @@ def main():
 
         except Exception as e:
             print(f"GT Error {path}: {e}")
-            # Cleanup se fallisce il caricamento GT
+            # Cleanup if fails to load GT
             for t in all_temps:
                 if len(anomaly_scores_dict[t]) > len(ood_gts_list):
                     anomaly_scores_dict[t].pop()
             continue
 
-        # Pulizia memoria
+        # Memory cleanup
         del img_tensor, per_pixel
         torch.cuda.empty_cache()
 
     # -------------------------------------------------------------------------
-    # CALCOLO METRICHE
+    # METRICS COMPUTATION & PRINTING
     # -------------------------------------------------------------------------
     if not ood_gts_list:
         print("Nessun dato valido raccolto per la valutazione.")
@@ -293,19 +290,18 @@ def main():
     ood_mask = (ood_gts_all == 1)
     ind_mask = (ood_gts_all == 0)
 
-    # Template label per le metriche (0=In-Dist, 1=Anomaly)
+    # Template label for the metrics (0=In-Dist, 1=Anomaly)
     val_label = np.concatenate((np.zeros(ind_mask.sum()), np.ones(ood_mask.sum())))
 
     best_auprc = 0.0
     best_t = 1.0
 
-    # Stampa tipo tabella:
-    #  T | AuPRC | FPR@95
+    # Print Table : T | AuPRC | FPR@95
     for t in all_temps:
         print(f"Computing metrics for T={t} ...")
         scores_all = np.array(anomaly_scores_dict[t])
 
-        # Estraggo i valori solo sui pixel validi
+        # Vales extraction on valid pixels only
         ood_out = scores_all[ood_mask]
         ind_out = scores_all[ind_mask]
         val_out = np.concatenate((ind_out, ood_out))
@@ -313,6 +309,7 @@ def main():
         prc_auc = average_precision_score(val_label, val_out)
         fpr = fpr_at_95_tpr(val_out, val_label)
 
+        # Highlight requested Ts in the table
         # Evidenzia i T richiesti dalla tabella
         prefix = " "
         if t in [0.5, 0.75, 1.1]:
