@@ -17,28 +17,78 @@ def cycle(dl):
             yield b
 
 
+# ----------------------------
+# NEW: shared mix config (mutable)
+# ----------------------------
+class TrainMixConfig:
+    def __init__(self, mix_city=3, mix_cnp=1, steps_per_epoch=200):
+        self.mix_city = int(mix_city)
+        self.mix_cnp = int(mix_cnp)
+        self.steps_per_epoch = int(steps_per_epoch)
+
+
 class MixedFiniteIterable(IterableDataset):
     """
-    Mixa City (ID) e CNP (OE/OOD) in un pattern fisso, per un numero finito di step/epoch.
+    Mixa City (ID) e CNP (OE/OOD) in un pattern, per un numero finito di step/epoch.
+    Ora il mix è DINAMICO: viene letto da una config aggiornata a ogni epoca.
     """
-    def __init__(self, dl_city, dl_cnp, mix_city=3, mix_cnp=1, steps_per_epoch=200):
+    def __init__(self, dl_city, dl_cnp, mix_cfg: TrainMixConfig):
         super().__init__()
         self.city = cycle(dl_city) if dl_city is not None else None
         self.cnp = cycle(dl_cnp)
-        self.pattern = ([0] * int(mix_city)) + ([1] * int(mix_cnp))  # 0=city, 1=cnp
-        self.steps_per_epoch = int(steps_per_epoch)
+        self.mix_cfg = mix_cfg
 
     def __iter__(self):
         n = 0
-        while n < self.steps_per_epoch:
-            for p in self.pattern:
-                if n >= self.steps_per_epoch:
+
+        # snapshot del mix all'inizio dell'epoca (stabile per tutta l'epoca)
+        mix_city = int(self.mix_cfg.mix_city)
+        mix_cnp = int(self.mix_cfg.mix_cnp)
+        steps_per_epoch = int(self.mix_cfg.steps_per_epoch)
+
+        pattern = ([0] * mix_city) + ([1] * mix_cnp)  # 0=city, 1=cnp
+
+        while n < steps_per_epoch:
+            for p in pattern:
+                if n >= steps_per_epoch:
                     break
                 if p == 0:
                     yield next(self.city) if self.city is not None else next(self.cnp)
                 else:
                     yield next(self.cnp)
                 n += 1
+
+
+# ----------------------------
+# NEW: callback to change mix between epochs 20..25
+# ----------------------------
+class MixScheduleCallback(L.Callback):
+    def __init__(self, mix_cfg: TrainMixConfig, base_mix_city: int, base_mix_cnp: int):
+        super().__init__()
+        self.mix_cfg = mix_cfg
+        self.base_mix_city = int(base_mix_city)
+        self.base_mix_cnp = int(base_mix_cnp)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        e = int(trainer.current_epoch)
+
+        # epoca 20..24 -> 2/4
+        if 20 <= e < 23:
+            self.mix_cfg.mix_city = 2
+            self.mix_cfg.mix_cnp = 2
+        elif 23 <= e < 25:
+            self.mix_cfg.mix_city = 2
+            self.mix_cfg.mix_cnp = 3
+        elif e >= 25:
+            self.mix_cfg.mix_city = 2
+            self.mix_cfg.mix_cnp = 4
+        else:
+            self.mix_cfg.mix_city = 3
+            self.mix_cfg.mix_cnp  = 1
+
+        # print leggero (utile per report/debug)
+        if trainer.is_global_zero:
+            print(f"[MIX_SCHED] epoch={e} -> mix_city={self.mix_cfg.mix_city}, mix_cnp={self.mix_cfg.mix_cnp}")
 
 
 class DebugCallback(L.Callback):
@@ -168,9 +218,7 @@ def main():
     ap.add_argument("--eval_only", action="store_true",
                     help="Run validation only on BOTH (City val + CNP val if provided) then exit")
 
-    # ----------------------------
     # hard-negative vehicles on Cityscapes
-    # ----------------------------
     ap.add_argument("--lambda_vehicle_ce", type=float, default=0.0,
                     help="Extra CE weight for vehicle pixels on Cityscapes (hard negatives). 0 disables.")
     ap.add_argument("--vehicle_train_ids", type=str, default="13,14,15,16,17,18",
@@ -192,7 +240,6 @@ def main():
     # ----------------------------
     # Datasets / loaders
     # ----------------------------
-    # CNP train (OE)
     cnp_train_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_train), img_size=img_size)
     dl_cnp_train = DataLoader(
         cnp_train_ds,
@@ -203,7 +250,6 @@ def main():
         drop_last=True,
     )
 
-    # CNP val (OOD)
     dl_cnp_val = None
     if args.cnp_zip_val is not None:
         cnp_val_ds = CNPResizeWrapper(CNPZipDataset(args.cnp_zip_val), img_size=img_size)
@@ -217,7 +263,6 @@ def main():
             drop_last=False,
         )
 
-    # City train
     city_train_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="train", img_size=img_size)
     dl_city = DataLoader(
         city_train_ds,
@@ -228,7 +273,6 @@ def main():
         drop_last=True,
     )
 
-    # City val
     city_val_ds = CityscapesFolderLabelIdsToTrainIds(args.city_root, split="val", img_size=img_size)
     city_val_ds = _maybe_subset(city_val_ds, args.val_limit)
     dl_city_val = DataLoader(
@@ -239,14 +283,11 @@ def main():
         pin_memory=torch.cuda.is_available(),
     )
 
-    # Mixed finite iterator for training
-    mixed_iter = MixedFiniteIterable(
-        dl_city=dl_city,
-        dl_cnp=dl_cnp_train,
-        mix_city=args.mix_city,
-        mix_cnp=args.mix_cnp,
-        steps_per_epoch=args.steps_per_epoch,
-    )
+    # ----------------------------
+    # NEW: dynamic mix config + iterable
+    # ----------------------------
+    mix_cfg = TrainMixConfig(mix_city=args.mix_city, mix_cnp=args.mix_cnp, steps_per_epoch=args.steps_per_epoch)
+    mixed_iter = MixedFiniteIterable(dl_city=dl_city, dl_cnp=dl_cnp_train, mix_cfg=mix_cfg)
     dl_train = DataLoader(mixed_iter, batch_size=None, num_workers=0)
 
     # ----------------------------
@@ -264,7 +305,6 @@ def main():
         else:
             print(f"[RESUME] --resume set but no last.ckpt found in {args.ckpt_dir}. Starting fresh.")
 
-    # If resuming from Lightning ckpt, don't re-init from bin
     pretrained_bin = None if resume_ckpt is not None else args.init_from_eomt_bin
 
     # ----------------------------
@@ -285,8 +325,6 @@ def main():
         train_epochs=args.max_epochs,
         pretrained_eomt_bin=pretrained_bin,
         use_lora=True,
-
-        # hard-negative control
         lambda_vehicle_ce=args.lambda_vehicle_ce,
         vehicle_train_ids=vehicle_ids,
     )
@@ -298,21 +336,21 @@ def main():
         dirpath=args.ckpt_dir,
         filename="bestOOD-{epoch:02d}-{step:06d}",
         save_last=True,
-        save_top_k=2,
-        monitor="val_ood/auprc_msp",
-        mode="max",
         every_n_epochs=1,
     )
 
     lrmon = LearningRateMonitor(logging_interval="step")
     dbg = DebugCallback(every_n_steps=20)
 
+    # NEW: mix schedule callback
+    mix_sched = MixScheduleCallback(mix_cfg=mix_cfg, base_mix_city=args.mix_city, base_mix_cnp=args.mix_cnp)
+
     trainer = L.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         precision="16-mixed" if torch.cuda.is_available() else "32-true",
         max_epochs=args.max_epochs,
-        callbacks=[ckpt, lrmon, dbg],
+        callbacks=[ckpt, lrmon, dbg, mix_sched],
         default_root_dir=args.log_dir,
         log_every_n_steps=10,
         gradient_clip_val=0.5,
