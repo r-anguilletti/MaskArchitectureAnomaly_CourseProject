@@ -41,7 +41,7 @@ class MixedFiniteIterable(IterableDataset):
     def __iter__(self):
         n = 0
 
-        # snapshot del mix all'inizio dell'epoca (stabile per tutta l'epoca)
+        # Snapshot of the mix at the start of the epoch (stable throughout the epoch)
         mix_city = int(self.mix_cfg.mix_city)
         mix_cnp = int(self.mix_cfg.mix_cnp)
         steps_per_epoch = int(self.mix_cfg.steps_per_epoch)
@@ -72,7 +72,7 @@ class MixScheduleCallback(L.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         e = int(trainer.current_epoch)
 
-        # epoca 20..24 -> 2/4
+        # epoch 20..24 -> 2/4
         if 20 <= e < 23:
             self.mix_cfg.mix_city = 2
             self.mix_cfg.mix_cnp = 2
@@ -86,7 +86,7 @@ class MixScheduleCallback(L.Callback):
             self.mix_cfg.mix_city = 3
             self.mix_cfg.mix_cnp  = 1
 
-        # print leggero (utile per report/debug)
+        # Lightweight print (useful for reporting/debugging)
         if trainer.is_global_zero:
             print(f"[MIX_SCHED] epoch={e} -> mix_city={self.mix_cfg.mix_city}, mix_cnp={self.mix_cfg.mix_cnp}")
 

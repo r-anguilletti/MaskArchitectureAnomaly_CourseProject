@@ -31,8 +31,8 @@ from training.lightning_module import LightningModule as EoMTLightningModule
 SEED = 42
 NUM_CLASSES = 19
 
-# Cityscapes trainIds (assunzione standard)
-# Veicoli: car,truck,bus,train,motorcycle,bicycle
+# Cityscapes trainIds (standard assumption)
+# Vehicles: car,truck,bus,train,motorcycle,bicycle
 IGNORE_VEHICLES = {9, 13, 14, 15, 16, 17, 18}
 
 
