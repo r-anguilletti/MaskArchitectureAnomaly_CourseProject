@@ -91,7 +91,7 @@ class AnomalySegmenter(L.LightningModule):
         self.vehicle_lambda_ramp_epochs = int(vehicle_lambda_ramp_epochs)
 
         # -------------------------------------------------
-        # INTERNAL schedules for ENERGY (no args from train)
+        # INTERNAL schedules for ENERGY and m_out
         # Requested:
         # - first 15 epochs: almost null contribution
         # - from 15 to 20: ramp to lambda=0.35
@@ -195,7 +195,7 @@ class AnomalySegmenter(L.LightningModule):
         return int(source)
 
     # ----------------------------
-    # Vehicle lambda schedule (KEEP NAME)
+    # Vehicle lambda schedule
     # ----------------------------
     def _lambda_vehicle_now(self) -> float:
         """
@@ -219,7 +219,7 @@ class AnomalySegmenter(L.LightningModule):
         return final * t
 
     # ----------------------------
-    # Energy lambda schedule (KEEP NAME STYLE)
+    # Energy lambda schedule
     # ----------------------------
     def _lambda_energy_now(self) -> float:
         """
@@ -243,7 +243,7 @@ class AnomalySegmenter(L.LightningModule):
         return final * t
 
     # ----------------------------
-    # m_out schedule (KEEP NAME STYLE)
+    # m_out schedule
     # ----------------------------
     def _m_out_now(self) -> float:
         """

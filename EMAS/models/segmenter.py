@@ -185,7 +185,7 @@ class AnomalySegmenter(L.LightningModule):
           return final * t
 
     # ----------------------------
-    # m_out schedule (KEEP NAME STYLE)
+    # m_out schedule
     # ----------------------------
     def _m_out_now(self) -> float:
         """
@@ -354,7 +354,7 @@ class AnomalySegmenter(L.LightningModule):
         oe_mask01 = (mask > 0).to(torch.int64)
         loss_e, *_ , sep = self.energy_loss(logits, oe_mask01)
 
-        lam_e = self._lambda_energy_now()  # always 0.0 now
+        lam_e = self._lambda_energy_now()
         loss = lam_e * loss_e
 
         self.log("train/loss_energy", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)

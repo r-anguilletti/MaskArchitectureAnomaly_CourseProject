@@ -18,7 +18,7 @@ def cycle(dl):
 
 
 # ----------------------------
-# NEW: shared mix config (mutable)
+# Shared mix config
 # ----------------------------
 class TrainMixConfig:
     def __init__(self, mix_city=3, mix_cnp=1, steps_per_epoch=200):
@@ -60,7 +60,7 @@ class MixedFiniteIterable(IterableDataset):
 
 
 # ----------------------------
-# NEW: callback to change mix between epochs 20..25
+# Callback to change mix between epochs 20..25
 # ----------------------------
 class MixScheduleCallback(L.Callback):
     def __init__(self, mix_cfg: TrainMixConfig, base_mix_city: int, base_mix_cnp: int):
@@ -274,7 +274,7 @@ def main():
     )
 
     # ----------------------------
-    # NEW: dynamic mix config + iterable
+    # Dynamic mix config + iterable
     # ----------------------------
     mix_cfg = TrainMixConfig(mix_city=args.mix_city, mix_cnp=args.mix_cnp, steps_per_epoch=args.steps_per_epoch)
     mixed_iter = MixedFiniteIterable(dl_city=dl_city, dl_cnp=dl_cnp_train, mix_cfg=mix_cfg)
@@ -330,7 +330,7 @@ def main():
     lrmon = LearningRateMonitor(logging_interval="step")
     dbg = DebugCallback(every_n_steps=20)
 
-    # NEW: mix schedule callback
+    # Mix schedule callback
     mix_sched = MixScheduleCallback(mix_cfg=mix_cfg, base_mix_city=args.mix_city, base_mix_cnp=args.mix_cnp)
 
     trainer = L.Trainer(
