@@ -2,7 +2,7 @@
 
 This repository contains the implementation of **EMAS** (implemented starting from EoMT architecture) for Anomaly Detection and Semantic Segmentation.
 
-## 📂 Project Structure
+## Project Structure
 
 * `models/`: Contains the core architecture definitions. Specifically, `segmenter.py` implements the standard architecture, while `segmenter_HN.py` is dedicated to the Hard Negative mining configuration.
 * `eval.py`: Computes anomaly detection metrics (AUPRC, FPR@95TPR) by comparing model predictions against ground truth masks. It supports multiple anomaly scoring methods, including MSP, MaxLogit, MaxEntropy and RbA.
@@ -14,9 +14,10 @@ This repository contains the implementation of **EMAS** (implemented starting fr
 * `train.py`: Main entry point for training the model.
 * `train_HN.py`: Script specific for Hard Negative mining training.
 * `train.ipynb`: Jupyter notebook designed for training and inference.
+* `eval.ipynb` : Jupyter notebook designed for evaluation.
 
 ---
-## 🚀 Usage
+## Usage
 
 The project workflow is streamlined through two designated Jupyter Notebooks, optimized for Google Colab but adaptable for local environments.
 
