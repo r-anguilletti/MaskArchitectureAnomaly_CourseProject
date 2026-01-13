@@ -166,9 +166,9 @@ class AnomalySegmenter(L.LightningModule):
     def _lambda_energy_now(self) -> float:
           """
           Requested schedule:
-          - epochs < 15: 0.15
-          - 15..20: linear ramp to 0.35
-          - >=20: 0.35
+          - epochs < 20: 0.15
+          - 20..25: linear ramp to 0.35
+          - >=25: 0.35
           """
           e = int(self.current_epoch)
           start = int(self.energy_lambda_start_epoch)

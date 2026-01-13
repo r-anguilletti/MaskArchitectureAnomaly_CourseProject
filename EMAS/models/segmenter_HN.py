@@ -93,14 +93,14 @@ class AnomalySegmenter(L.LightningModule):
         # -------------------------------------------------
         # INTERNAL schedules for ENERGY and m_out
         # Requested:
-        # - first 15 epochs: almost null contribution
-        # - from 15 to 20: ramp to lambda=0.35
+        # - first 20 epochs: 0.15
+        # - from 20 to 25: ramp to lambda=0.35
         # - then keep fixed
         # - m_out ramps together toward -6
         # -------------------------------------------------
         self.energy_lambda_final = 0.35
         self.energy_lambda_start_epoch = 20
-        self.energy_lambda_ramp_epochs = 5  # 15..20
+        self.energy_lambda_ramp_epochs = 5  
 
         # m_out schedule: start softer, end at -6
         self.m_out_start = -2.0
@@ -223,11 +223,11 @@ class AnomalySegmenter(L.LightningModule):
     # ----------------------------
     def _lambda_energy_now(self) -> float:
         """
-        Requested schedule:
-        - epochs < 15: 0.15
-        - 15..20: linear ramp to 0.35
-        - >=20: 0.35
-        """
+          Requested schedule:
+          - epochs < 20: 0.15
+          - 20..25: linear ramp to 0.35
+          - >=25: 0.35
+          """
         e = int(self.current_epoch)
         start = int(self.energy_lambda_start_epoch)
         ramp = max(1, int(self.energy_lambda_ramp_epochs))
@@ -248,9 +248,9 @@ class AnomalySegmenter(L.LightningModule):
     def _m_out_now(self) -> float:
         """
         Linear schedule for m_out:
-        - epochs < 15: m_out_start (-2.0)
-        - 15..20: ramp to m_out_final (-6.0)
-        - >=20: m_out_final
+        - epochs < 20: m_out_start (-2.0)
+        - 20..25: ramp to m_out_final (-6.0)
+        - >=25: m_out_final
         """
         e = int(self.current_epoch)
         start = int(self.m_out_start_epoch)
